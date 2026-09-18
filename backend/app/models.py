@@ -66,8 +66,50 @@ class MessageUnparsed(Base):
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now())
 
 
+class Session(Base):
+    """A burst of activity in one chat, grouped for chunking (Phase 2).
+
+    Chat logs break fixed-size-chunk RAG: short context-free messages don't embed
+    usefully in isolation, so sessionizer.py groups messages by a time-gap heuristic
+    and each session gets a synthesized context header (participants + rough topic)
+    that is prepended to its chunk text. message_ids lists every message in the
+    session (content and non-content) so time-range answers can report on all of it.
+    """
+
+    __tablename__ = "sessions"
+
+    id: Mapped[uuid.UUID] = mapped_column(
+        UUID(as_uuid=True),
+        primary_key=True,
+        default=uuid.uuid4,
+        server_default=text("gen_random_uuid()"),
+    )
+    chat_id: Mapped[str] = mapped_column(Text, index=True)
+    started_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), index=True)
+    ended_at: Mapped[datetime] = mapped_column(DateTime(timezone=True))
+    # One-line synthesized summary (participants, date range, rough topic). Stored
+    # alongside the chunk rather than only concatenated into chunk.content so
+    # downstream code can display/reuse it without re-deriving it.
+    header_text: Mapped[str] = mapped_column(Text)
+    # UUIDs (as strings) of every Message in the session.
+    message_ids: Mapped[list] = mapped_column(
+        JSONB, server_default=text("'[]'::jsonb")
+    )
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), server_default=func.now()
+    )
+
+
 class Chunk(Base):
-    """Empty placeholder for Phase 2 embeddings - provisioned now to avoid a migration later."""
+    """A retrievable unit of group history: one embedded text span (Phase 2).
+
+    Phase 1 provisioned this table (empty) with chunks.message_id as a 1:1 placeholder.
+    Phase 2 builds chunks from *sessions* that may span many messages, so message_id
+    had to become nullable: this is why the migration adds session_id and message_ids
+    (the message UUIDs whose text is embedded in this chunk). Backfill chunks set
+    message_id to the single message when the chunk covers exactly one message, and to
+    NULL otherwise; a future per-message live-embedding path can still use message_id.
+    """
 
     __tablename__ = "chunks"
 
@@ -77,9 +119,22 @@ class Chunk(Base):
         default=uuid.uuid4,
         server_default=text("gen_random_uuid()"),
     )
-    message_id: Mapped[uuid.UUID] = mapped_column(
-        ForeignKey("messages.id", ondelete="CASCADE"), index=True
+    message_id: Mapped[uuid.UUID | None] = mapped_column(
+        ForeignKey("messages.id", ondelete="CASCADE"), index=True, nullable=True
     )
+    session_id: Mapped[uuid.UUID | None] = mapped_column(
+        # Why session_id instead of just message_id: one chunk spans a session slice
+        # (see sessionizer.py). Keying chunks on session_id makes embedding idempotent
+        # (delete-and-replace that session's chunks) and lets time-range questions pull
+        # all chunks of a session without joining message tables.
+        ForeignKey("sessions.id", ondelete="CASCADE"),
+        index=True,
+        nullable=True,
+    )
+    # UUIDs of the Messages whose text is embedded in this chunk.
+    message_ids: Mapped[list | None] = mapped_column(JSONB, nullable=True)
     content: Mapped[str] = mapped_column(Text)
     embedding: Mapped[list] = mapped_column(Vector(1024))
-    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now())
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), server_default=func.now()
+    )

@@ -41,3 +41,58 @@ class WebhookResponse(BaseModel):
     status: str
     stored: bool = False
     deduplicated: bool = False
+
+
+# --- Phase 2: ingest + ask ------------------------------------------------------
+
+class IngestResponse(BaseModel):
+    """POST /ingest/export summary."""
+
+    chat_id: str
+    chat_name: str | None
+    source: str
+    messages_parsed: int  # records parsed out of the file
+    messages_imported: int  # new rows written to `messages`
+    messages_duplicate: int  # already present (idempotent re-import)
+    sessions_built: int
+    chunks_written: int
+    msg_type_counts: dict[str, int]  # parsed message types, for diagnostics
+
+
+class AskRequest(BaseModel):
+    """POST /ask body."""
+
+    chat_id: str
+    question: str
+
+
+class Citation(BaseModel):
+    """One sourced message backing part of the answer."""
+
+    message_id: str
+    sender_name: str | None
+    timestamp: str | None
+    chat_id: str
+    chat_name: str | None
+    preview: str
+
+
+class AnswerSource(BaseModel):
+    """Retrieval source: which chunk/session/messages the answer pulled from."""
+
+    chunk_id: str | None = None
+    session_id: str | None = None
+    score: float | None = None
+    message_ids: list[str] = []
+    content_preview: str | None = None
+
+
+class AnswerResponse(BaseModel):
+    """POST /ask output: a cited answer built from retrieved group history."""
+
+    chat_id: str
+    question: str
+    route: str  # "semantic" | "time_range"
+    answer_text: str
+    citations: list[Citation] = []
+    sources: list[AnswerSource] = []

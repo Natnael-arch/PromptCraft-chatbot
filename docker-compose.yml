@@ -69,6 +69,19 @@ services:
       WAHA_API_KEY: ${WAHA_API_KEY:-waha_dev_key_change_me}
       WAHA_SESSION: ${WAHA_SESSION:-default}
       REDIS_URL: ${REDIS_URL:-redis://redis:6379/0}
+      # Phase 2: embeddings / sessionization / retrieval knobs.
+      EMBEDDING_PROVIDER: ${EMBEDDING_PROVIDER:-mock}
+      EMBEDDING_API_URL: ${EMBEDDING_API_URL:-}
+      EMBEDDING_API_KEY: ${EMBEDDING_API_KEY:-}
+      EMBEDDING_MODEL: ${EMBEDDING_MODEL:-bge-m3}
+      EMBEDDING_DIMENSIONS: ${EMBEDDING_DIMENSIONS:-1024}
+      EMBEDDING_BATCH_SIZE: ${EMBEDDING_BATCH_SIZE:-64}
+      SESSION_GAP_MINUTES: ${SESSION_GAP_MINUTES:-30}
+      SESSION_MAX_MESSAGES: ${SESSION_MAX_MESSAGES:-200}
+      SESSION_MAX_CHUNK_CHARS: ${SESSION_MAX_CHUNK_CHARS:-8000}
+      RETRIEVAL_TOP_K: ${RETRIEVAL_TOP_K:-6}
+      RETRIEVAL_RRF_K: ${RETRIEVAL_RRF_K:-60}
+      EXPORT_BOT_NAME: ${EXPORT_BOT_NAME:-}
     depends_on:
       postgres:
         condition: service_healthy

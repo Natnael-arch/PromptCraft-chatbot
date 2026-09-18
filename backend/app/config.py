@@ -28,6 +28,39 @@ class Settings(BaseSettings):
     # Pre-provisioned for the Phase 3 job queue; not used by Phase 1 code paths.
     redis_url: str = "redis://redis:6379/0"
 
+    # --- Embeddings (Phase 2) ---
+    # Provider name: "openai_compatible" (any OpenAI-style POST <url>/embeddings
+    # server, e.g. a vLLM/Ollama gateway serving a 1024-dim model) or "mock"
+    # (deterministic vectors, DEV ONLY - lets the pipeline run with no API key).
+    # Match EMBEDDING_DIMENSIONS to the provider's model output: the chunks table
+    # is VECTOR(1024), so the default bge-m3 (1024 dims) fits the schema.
+    embedding_provider: str = "mock"
+    embedding_api_url: str = ""  # e.g. http://localhost:11434/v1 (Ollama)
+    embedding_api_key: str = ""
+    embedding_model: str = "bge-m3"
+    embedding_dimensions: int = 1024
+    embedding_batch_size: int = 64
+    embedding_timeout: float = 120.0
+
+    # --- Sessionization (Phase 2) ---
+    # A gap of this many minutes with no activity starts a new session.
+    session_gap_minutes: int = 30
+    # A single continuously-active conversation is capped at this many messages per
+    # session so one busy day does not become one giant un-embed-able blob.
+    session_max_messages: int = 200
+    # Chunks are split at message boundaries to stay under this many characters.
+    session_max_chunk_chars: int = 8000
+
+    # --- Retrieval (Phase 2) ---
+    retrieval_top_k: int = 6
+    # RRF k constant: merged_score = sum(1 / (k + rank)). k=60 is the classic value.
+    retrieval_rrf_k: int = 60
+
+    # --- Export import (Phase 2) ---
+    # If set, messages from this sender name are flagged from_me (the bot's own
+    # messages in the export).
+    export_bot_name: str = ""
+
     model_config = SettingsConfigDict(
         env_file=".env", env_file_encoding="utf-8", extra="ignore"
     )

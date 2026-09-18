@@ -1,0 +1,1 @@
+"""Phase 2 retrieval: hybrid (vector + keyword) search over embedded sessions."""
