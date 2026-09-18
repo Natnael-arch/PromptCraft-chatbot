@@ -4,10 +4,16 @@ The provider is swappable via the EMBEDDING_PROVIDER env var, but there is a rea
 working default behind every abstraction here:
 
 * ``openai_compatible`` - POSTs batches to any OpenAI-style ``/embeddings`` endpoint
-  (a local Ollama/vLLM gateway, an OpenAI-compatible cloud host, ...). This is the
-  provider to use for production. The default model name is bge-m3, which outputs
-  1024-d vectors - exactly matching the ``chunks.embedding VECTOR(1024)`` schema.
-  Set EMBEDDING_API_URL/API_KEY/MODEL to point it somewhere real.
+  (a local Ollama/vLLM gateway, an OpenAI-compatible cloud host, ...). The default
+  model name is bge-m3, which outputs 1024-d vectors - exactly matching the
+  ``chunks.embedding VECTOR(1024)`` schema. Set EMBEDDING_API_URL/API_KEY/MODEL to
+  point it somewhere real.
+* ``gemini`` - Google Gemini via the google-genai SDK. We request
+  ``output_dimensionality=1024`` as a *request parameter* (Gemini's native MRL
+  truncation - the API truncates server-side, no client-side slicing). The truncated
+  vector is L2-renormalized to unit length, because the API does not renormalize
+  truncated MRL output and cosine similarity needs unit vectors. Requires
+  GEMINI_API_KEY.
 * ``mock`` - deterministic pseudo-random unit-normalized vectors, DEV ONLY. It lets
   the whole pipeline (ingest -> sessions -> chunks) run end-to-end with no API key
   or network, so the code path is exercised before a real endpoint is wired up.
@@ -121,6 +127,111 @@ class OpenAICompatibleEmbedder:
 
 
 @dataclass
+class GeminiEmbedder:
+    """Gemini embeddings via the google-genai SDK (``models.embed_content``).
+
+    MRL truncation (Gemini's ``outputDimensionality``) is a NATIVE REQUEST
+    PARAMETER - the API truncates server-side to the requested size. Per the
+    Gemini docs we do NOT slice client-side; we always ask for
+    ``output_dimensionality=self.dimensions`` (default 1024) to match the
+    ``chunks.embedding VECTOR(1024)`` column exactly.
+
+    One caveat per the docs: the truncated MRL output is NOT renormalized by the
+    API, so we L2-renormalize the returned vector ourselves (cosine similarity
+    in pgvector assumes unit vectors). This is a normalization step, not a
+    truncation step.
+
+    Batching: ``embed_content`` accepts a list of contents per request; Gemini
+    caps a single embedding request at 100 inputs, so ``batch_size`` defaults to
+    the app's ``EMBEDDING_BATCH_SIZE`` (64) which is under the limit.
+    """
+
+    name: str = "gemini"
+    api_key: str = ""
+    model: str = settings.embedding_model
+    dimensions: int = settings.embedding_dimensions
+    batch_size: int = settings.embedding_batch_size
+    task_type: str = "RETRIEVAL_DOCUMENT"
+
+    def __post_init__(self) -> None:
+        self.api_key = self.api_key or settings.gemini_api_key
+        if self.api_key:
+            self._client = self._make_client()
+        else:
+            self._client = None
+
+    def _make_client(self):
+        try:
+            from google import genai
+        except ImportError as exc:  # pragma: no cover - import guarded at runtime
+            raise EmbeddingRequestError(
+                "google-genai is not installed. Add 'google-genai' to "
+                "requirements.txt and pip install it, or switch "
+                "EMBEDDING_PROVIDER=mock for offline development."
+            ) from exc
+        return genai.Client(api_key=self.api_key)
+
+    def embed(self, texts: list[str]) -> list[list[float]]:
+        if not texts:
+            return []
+        if not self._client:
+            raise EmbeddingRequestError(
+                "GEMINI_API_KEY is not set - set it to use the gemini embedding "
+                "provider, or switch EMBEDDING_PROVIDER=mock for offline development."
+            )
+        try:
+            from google.genai import types as genai_types
+        except ImportError as exc:  # pragma: no cover
+            raise EmbeddingRequestError(
+                "google-genai is not installed. Add 'google-genai' to "
+                "requirements.txt and pip install it."
+            ) from exc
+
+        vectors: list[list[float]] = []
+        for start in range(0, len(texts), self.batch_size):
+            batch = texts[start : start + self.batch_size]
+            response = self._client.models.embed_content(
+                model=self.model,
+                contents=batch,
+                config=genai_types.EmbedContentConfig(
+                    output_dimensionality=self.dimensions,
+                    task_type=self.task_type,
+                ),
+            )
+            embeddings = response.embeddings  # list[ContentEmbedding]
+            if not embeddings or len(embeddings) != len(batch):
+                raise EmbeddingRequestError(
+                    f"Gemini embedding batch {start // self.batch_size + 1}: "
+                    f"expected {len(batch)} vectors, got {len(embeddings) if embeddings else 0}"
+                )
+            for i, embedding in enumerate(embeddings):
+                vec = embedding.values
+                if not isinstance(vec, list) or len(vec) != self.dimensions:
+                    raise EmbeddingDimensionError(
+                        f"Gemini embedding batch {start // self.batch_size + 1}, "
+                        f"item {i}: expected {self.dimensions}-d vector (must match "
+                        f"chunks.embedding VECTOR({self.dimensions})), "
+                        f"got {len(vec) if isinstance(vec, list) else 'non-list'}. "
+                        f"output_dimensionality={self.dimensions} was requested, so "
+                        f"this is a model/API mismatch."
+                    )
+                vectors.append(_l2_normalize([float(x) for x in vec]))
+        return vectors
+
+
+def _l2_normalize(vec: list[float]) -> list[float]:
+    """Unit-normalize ``vec`` in place of truncation (MRL output is not renormalized).
+
+    Gemini truncates server-side; the returned truncated vector is NOT unit length,
+    and cosine similarity assumes unit vectors, so we normalize after embedding.
+    """
+    norm = (sum(x * x for x in vec)) ** 0.5
+    if norm == 0.0:
+        return vec
+    return [x / norm for x in vec]
+
+
+@dataclass
 class MockEmbedder:
     """DEV ONLY: deterministic unit vectors so the pipeline runs with zero config.
 
@@ -154,12 +265,19 @@ def get_embedder(**overrides: Any) -> EmbeddingProvider:
             batch_size=overrides.get("batch_size", settings.embedding_batch_size),
             timeout=overrides.get("timeout", settings.embedding_timeout),
         )
+    if provider_name == "gemini":
+        return GeminiEmbedder(
+            api_key=overrides.get("api_key", settings.gemini_api_key),
+            model=overrides.get("model", settings.embedding_model),
+            dimensions=overrides.get("dimensions", settings.embedding_dimensions),
+            batch_size=overrides.get("batch_size", settings.embedding_batch_size),
+        )
     if provider_name == "mock":
         return MockEmbedder(
             dimensions=overrides.get("dimensions", settings.embedding_dimensions)
         )
     raise EmbeddingRequestError(
-        f"Unknown EMBEDDING_PROVIDER={provider_name!r} (expected openai_compatible | mock)"
+        f"Unknown EMBEDDING_PROVIDER={provider_name!r} (expected openai_compatible | gemini | mock)"
     )
 
 

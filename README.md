@@ -227,6 +227,47 @@ curl -s -X POST http://localhost:8000/webhook/waha \
 
 ---
 
+## 5.5. Phase 2/3: embedding, retrieval, and answer providers
+
+Phase 2 added a retrieval pipeline over the captured history: exported/backfilled
+messages are grouped into **sessions**, each session is split into **chunks**, and
+each chunk is embedded into a `vector(1024)` in the `chunks` table (imports are
+idempotent — re-importing a file deletes-and-replaces that chat's chunks, never
+duplicates). Phase 3 made **Gemini the primary provider** for embeddings and
+answer generation, while keeping the mock/extractive providers for offline dev.
+
+### Embedding provider (`EMBEDDING_PROVIDER`)
+
+| Provider             | How it works                                                        | Needs API key |
+| -------------------- | ------------------------------------------------------------------- | ------------- |
+| `gemini`             | Gemini via the google-genai SDK; requests MRL `output_dimensionality=1024` (an API request param, the API truncates server-side) and L2-renormalizes the truncated vector. Default model `gemini-embedding-001`. | `GEMINI_API_KEY` |
+| `openai_compatible`  | Any OpenAI-style `/embeddings` server (Ollama/vLLM/...). Use `EMBEDDING_API_URL`/`EMBEDDING_API_KEY`/`EMBEDDING_MODEL`. | API key for your server |
+| `mock`               | Deterministic pseudo-random unit vectors, **DEV ONLY** (offline, no key). Good for exercising the pipeline end-to-end. | — |
+
+`EMBEDDING_DIMENSIONS` must match the provider's output dims (the schema column
+is `VECTOR(1024)`). For Gemini that means `1024`; MRL truncation happens natively
+via the request parameter, not via client-side slicing.
+
+### Answer provider (`ANSWER_PROVIDER`)
+
+| Provider       | Behavior                                                                 | Needs API key |
+| -------------- | ------------------------------------------------------------------------ | ------------- |
+| `gemini`       | Retrieves chunks/sessions the same way, then passes the extracted context + citations to Gemini (`ANSWER_MODEL`, default `gemini-2.5-flash`) to synthesize a natural-language `answer_text`. `citations`/`sources` are unchanged (routes_ask contract is stable). Falls back to extractive on any failure. | `GEMINI_API_KEY` |
+| `extractive`   | Returns the Phase-2 bullet list verbatim — offline default, no LLM call.  | —             |
+
+### Ask flow (POST /ask)
+
+1. `route_question` classifies the question: **time_range** (regex, temporal
+   phrases/dates) or **semantic**.
+2. **semantic** routes embed the question with the active embedder and run
+   `hybrid_search` (pgvector cosine + full-text, merged with reciprocal-rank
+   fusion) over that chat's chunks.
+3. The answer provider synthesizes `answer_text` over the retrieved context;
+   `citations` (message-level) and `sources` (chunk/session-level) are always
+   attached.
+
+---
+
 ## 6. Troubleshooting
 
 **No messages arriving / `GET /messages` stays empty — check, in order:**

@@ -28,19 +28,33 @@ class Settings(BaseSettings):
     # Pre-provisioned for the Phase 3 job queue; not used by Phase 1 code paths.
     redis_url: str = "redis://redis:6379/0"
 
-    # --- Embeddings (Phase 2) ---
+    # --- Embeddings (Phase 2/3) ---
     # Provider name: "openai_compatible" (any OpenAI-style POST <url>/embeddings
-    # server, e.g. a vLLM/Ollama gateway serving a 1024-dim model) or "mock"
-    # (deterministic vectors, DEV ONLY - lets the pipeline run with no API key).
+    # server, e.g. a vLLM/Ollama gateway serving a 1024-dim model), "gemini"
+    # (Google Gemini via the google-genai SDK), or "mock" (deterministic vectors,
+    # DEV ONLY - lets the pipeline run with no API key).
     # Match EMBEDDING_DIMENSIONS to the provider's model output: the chunks table
-    # is VECTOR(1024), so the default bge-m3 (1024 dims) fits the schema.
+    # is VECTOR(1024). Gemini truncates server-side via output_dimensionality, so
+    # gemini-embedding-001 (native 3072-d) fits the schema at 1024-d.
     embedding_provider: str = "mock"
     embedding_api_url: str = ""  # e.g. http://localhost:11434/v1 (Ollama)
     embedding_api_key: str = ""
-    embedding_model: str = "bge-m3"
+    embedding_model: str = "gemini-embedding-001"
     embedding_dimensions: int = 1024
     embedding_batch_size: int = 64
     embedding_timeout: float = 120.0
+
+    # --- Gemini (Phase 3) ---
+    # API key for the Google AI Studio / Gemini API (used when
+    # EMBEDDING_PROVIDER=gemini and for Gemini answer generation).
+    gemini_api_key: str = ""
+
+    # --- Answer generation (Phase 3) ---
+    # Provider name: "gemini" (default gemini-2.5-flash) synthesizes the answer
+    # over the retrieved chunks/citations; "extractive" keeps returning the
+    # Phase-2 bullet list with no LLM call (offline / no API key).
+    answer_provider: str = "extractive"
+    answer_model: str = "gemini-2.5-flash"
 
     # --- Sessionization (Phase 2) ---
     # A gap of this many minutes with no activity starts a new session.

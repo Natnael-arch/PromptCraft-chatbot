@@ -1,13 +1,22 @@
 """Build a cited answer from retrieved sessions/chunks.
 
-The function here is deliberately a pure-Python, LLM-free extractive pipeline:
-it pulls supporting chunks (or time-range sessions), quotes relevant snippets, and
-attaches structured citations (message_id, sender, timestamp, chat) so any
-downstream code or human can trace the source.
+This is the retrieve-then-answer core. Retrieval is the Phase-2 extractive
+pipeline: it pulls supporting chunks (or time-range sessions), quotes relevant
+snippets, and attaches structured citations (message_id, sender, timestamp, chat)
+so any downstream code or human can trace the source.
 
-The only LLM needed is the one reading the output. When a real LLM is available
-``answer_text`` is the natural prompt-input for a summarization step; the
-structured ``sources`` list is the faithful context window.
+Answer generation is swappable via ``ANSWER_PROVIDER``:
+
+* ``extractive`` (default, offline) - returns the Phase-2 bullet list verbatim.
+  No API key, no LLM call.
+* ``gemini`` - the retrieved content/citations are passed to Gemini
+  (default ``gemini-2.5-flash``, overridable with ``ANSWER_MODEL``) which
+  synthesizes a natural-language answer. The retrieval and the structured
+  ``citations``/``sources`` lists are unchanged - only ``answer_text`` is
+  synthesized.
+
+The ``answer_text``/``sources`` return contract is stable across providers, so
+``routes_ask.py`` needs no changes.
 """
 
 import re
@@ -20,6 +29,64 @@ from sqlalchemy.orm import Session
 from app.config import settings
 from app.models import Chunk, Message, Session as ChatSession
 from app.retrieval.search import hybrid_search
+
+
+# ---------------------------------------------------------------------------
+# Answer generation: extractive (default) vs. Gemini synthesis
+# ---------------------------------------------------------------------------
+
+def _extractive_answer(question: str, answer_text: str) -> str:
+    """Return the Phase-2 extractive answer text unchanged (offline default)."""
+    return answer_text
+
+
+def _gemini_synthesize(question: str, answer_text: str) -> str:
+    """Synthesize ``answer_text`` over the retrieved context with Gemini.
+
+    The ``answer_text`` argument carries the retrieved chunks/citations as an
+    extractive bullet list; we pass it as context and ask Gemini for a concise,
+    grounded answer instead. Falls back to the extractive text on any failure
+    (no key, network, API error) so /ask keeps working offline.
+    """
+    api_key = settings.gemini_api_key
+    if not api_key:
+        return answer_text
+    try:
+        from google import genai
+        from google.genai import types as genai_types
+    except ImportError:
+        return answer_text
+
+    prompt = (
+        "You are summarizing a WhatsApp group conversation history. "
+        "Using ONLY the context below, answer the user's question in a concise "
+        "natural-language reply (a few sentences). Stay grounded in the context; "
+        "do not invent facts. If the context has no relevant information, say so.\n\n"
+        f"CONTEXT:\n{answer_text}\n\n"
+        f"QUESTION: {question}\n\n"
+        "ANSWER:"
+    )
+    try:
+        client = genai.Client(api_key=api_key)
+        response = client.models.generate_content(
+            model=settings.answer_model,
+            contents=prompt,
+            config=genai_types.GenerateContentConfig(
+                temperature=0.4,
+                max_output_tokens=500,
+            ),
+        )
+        return (response.text or "").strip() or answer_text
+    except Exception:
+        return answer_text
+
+
+def _apply_answer_provider(question: str, answer_text: str) -> str:
+    """Route ``answer_text`` through the configured ANSWER_PROVIDER."""
+    provider = settings.answer_provider
+    if provider == "gemini":
+        return _gemini_synthesize(question, answer_text)
+    return _extractive_answer(question, answer_text)
 
 
 # ---------------------------------------------------------------------------
@@ -318,7 +385,7 @@ def answer_question(
             "chat_id": chat_id,
             "question": question,
             "route": route,
-            "answer_text": answer_text,
+            "answer_text": _apply_answer_provider(question, answer_text),
             "citations": citations,
             "sources": sources,
         }
@@ -333,7 +400,7 @@ def answer_question(
         "chat_id": chat_id,
         "question": question,
         "route": route,
-        "answer_text": answer_text,
+        "answer_text": _apply_answer_provider(question, answer_text),
         "citations": citations,
         "sources": sources,
     }
