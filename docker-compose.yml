@@ -1,0 +1,82 @@
+name: unipods-bot
+
+services:
+  postgres:
+    image: pgvector/pgvector:pg16
+    restart: unless-stopped
+    environment:
+      POSTGRES_USER: ${POSTGRES_USER:-unipods}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-unipods_dev_password}
+      POSTGRES_DB: ${POSTGRES_DB:-unipods}
+    volumes:
+      - postgres_data:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U $${POSTGRES_USER} -d $${POSTGRES_DB}"]
+      interval: 5s
+      timeout: 5s
+      retries: 10
+
+  redis:
+    image: redis:7-alpine
+    restart: unless-stopped
+    # No persistence needed yet - provisioned for the Phase 3 job queue.
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 5s
+      timeout: 3s
+      retries: 10
+
+  waha:
+    image: devlikeapro/waha:noweb-2026.8.2
+    restart: unless-stopped
+    ports:
+      - "${WAHA_PORT:-3000}:3000"
+    volumes:
+      # Session auth lives in =/app/.sessions; the named volume is what makes a
+      # paired session survive `docker compose restart waha` without re-scanning.
+      - waha_sessions:/app/.sessions
+    environment:
+      WHATSAPP_DEFAULT_ENGINE: NOWEB
+      # API auth: all WAHA API calls must send X-Api-Key. WAHA silently auto-generates
+      # a random key when this is empty, which would break the backend's /health probe.
+      WAHA_API_KEY: ${WAHA_API_KEY:-waha_dev_key_change_me}
+      # Global webhook: applies to every session. WAHA reaches the backend over the
+      # compose network (NOT localhost). message events only for Phase 1.
+      WHATSAPP_HOOK_URL: ${WHATSAPP_HOOK_URL:-http://backend:8000/webhook/waha}
+      WHATSAPP_HOOK_EVENTS: message
+      WAHA_LOG_LEVEL: info
+    healthcheck:
+      test: ["CMD", "node", "-e", "fetch('http://localhost:3000/ping').then(r=>{if(!r.ok)process.exit(1)}).catch(()=>process.exit(1))"]
+      interval: 10s
+      timeout: 5s
+      retries: 10
+      start_period: 15s
+
+  backend:
+    build: ./backend
+    restart: unless-stopped
+    ports:
+      - "${BACKEND_PORT:-8000}:8000"
+    environment:
+      # Empty by default -> config.py builds the URL from POSTGRES_* below.
+      DATABASE_URL: ${DATABASE_URL:-}
+      POSTGRES_USER: ${POSTGRES_USER:-unipods}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-unipods_dev_password}
+      POSTGRES_HOST: postgres
+      POSTGRES_PORT: 5432
+      POSTGRES_DB: ${POSTGRES_DB:-unipods}
+      WAHA_BASE_URL: ${WAHA_BASE_URL:-http://waha:3000}
+      WAHA_API_KEY: ${WAHA_API_KEY:-waha_dev_key_change_me}
+      WAHA_SESSION: ${WAHA_SESSION:-default}
+      REDIS_URL: ${REDIS_URL:-redis://redis:6379/0}
+    depends_on:
+      postgres:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+      waha:
+        condition: service_healthy
+
+volumes:
+  postgres_data:
+  waha_sessions:
