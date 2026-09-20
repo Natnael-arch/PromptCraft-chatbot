@@ -90,6 +90,12 @@ services:
       TRANSCRIBE_WINDOW_SECONDS: ${TRANSCRIBE_WINDOW_SECONDS:-1800}
       VOICE_MAX_UPLOAD_BYTES: ${VOICE_MAX_UPLOAD_BYTES:-209715200}
       VOICE_SEGMENTS_PER_CHUNK: ${VOICE_SEGMENTS_PER_CHUNK:-50}
+      # Phase 4: the bot's own WhatsApp JID (e.g. 15551234567@c.us). When empty,
+      # auto-replies discover it from WAHA session info at first use (so group
+      # @-mentions work as soon as the session is paired).
+      BOT_WHATSAPP_ID: ${BOT_WHATSAPP_ID:-}
+      REPLY_COOLDOWN_SECONDS: ${REPLY_COOLDOWN_SECONDS:-30}
+      REPLY_MAX_CHARS: ${REPLY_MAX_CHARS:-4000}
     depends_on:
       postgres:
         condition: service_healthy

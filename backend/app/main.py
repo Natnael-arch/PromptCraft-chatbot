@@ -13,6 +13,14 @@ from app.webhook import router as webhook_router
 
 logger = logging.getLogger(__name__)
 
+# Default root logger is WARNING-only, which hides the app's INFO diagnostics
+# (webhook captures, auto-reply decisions in Phase 4). Wire stderr to INFO so
+# those observability lines actually show in `docker compose logs`.
+logging.basicConfig(
+    level=logging.INFO,
+    format="%(asctime)s %(levelname)s %(name)s: %(message)s",
+)
+
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):

@@ -98,6 +98,17 @@ class Settings(BaseSettings):
     # under session_max_chunk_chars, the shared char budget).
     voice_segments_per_chunk: int = 50
 
+    # --- Live replies (Phase 4) ---
+    # The bot's own WhatsApp JID (e.g. 15551234567@c.us). When empty it is
+    # discovered lazily from the WAHA session info and cached in memory.
+    bot_whatsapp_id: str = ""
+    # Per-chat in-memory cooldown between automatic replies, in seconds. Prevents
+    # spam / feedback loops in busy groups. Not persisted (Phase 5 moves to Redis).
+    reply_cooldown_seconds: int = 30
+    # Automatic replies longer than this many characters are truncated before
+    # sendText (WhatsApp text messages cap at 4096 chars).
+    reply_max_chars: int = 4000
+
     model_config = SettingsConfigDict(
         env_file=".env", env_file_encoding="utf-8", extra="ignore"
     )

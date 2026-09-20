@@ -20,6 +20,8 @@ Payload shape (verified against current WAHA docs, https://waha.devlike.pro/docs
         "media": {"url": "...", "mimetype": "...", "filename": "..."} | null,
         "replyTo": {"id": "...", "body": "..."} | null,
         "_data": {...}                 # engine internals (pushname, type, ...)
+                                       # group @-mentions live here, in
+                                       # _data.message.extendedTextMessage.contextInfo.mentionedJid
       },
       "engine": "NOWEB"
     }
@@ -33,13 +35,14 @@ import logging
 from datetime import datetime, timezone
 from typing import Any
 
-from fastapi import APIRouter, Depends, Request
+from fastapi import APIRouter, BackgroundTasks, Depends, Request
 from sqlalchemy import select
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import Session
 
 from app.db import get_db
 from app.models import Message, MessageUnparsed
+from app.reply.reply_worker import reply_to_captured
 from app.schemas import WebhookResponse
 
 logger = logging.getLogger(__name__)
@@ -178,7 +181,9 @@ def _store_unparsed(db: Session, event: str, reason: str, raw: Any) -> None:
 
 @router.post("/webhook/waha", response_model=WebhookResponse, status_code=200)
 async def waha_webhook(
-    request: Request, db: Session = Depends(get_db)
+    request: Request,
+    background_tasks: BackgroundTasks,
+    db: Session = Depends(get_db),
 ) -> WebhookResponse:
     try:
         body = await request.json()
@@ -241,4 +246,11 @@ async def waha_webhook(
         message.from_me,
         message.msg_type,
     )
+
+    # Phase 4: schedule the auto-reply worker as a background task so WAHA's
+    # webhook delivery is acknowledged instantly. The worker runs after this
+    # response is sent, opens its own DB session, and answers via the same
+    # answer_question pipeline /ask uses (no self-HTTP round-trip). Any failure
+    # inside it is logged and does not affect this response.
+    background_tasks.add_task(reply_to_captured, message.chat_id, payload)
     return WebhookResponse(status="ok", stored=True)
