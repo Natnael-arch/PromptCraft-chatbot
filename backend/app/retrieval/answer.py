@@ -27,8 +27,9 @@ from sqlalchemy import select
 from sqlalchemy.orm import Session
 
 from app.config import settings
-from app.models import Chunk, Message, Session as ChatSession
+from app.models import Chunk, Message, Recording, Session as ChatSession
 from app.retrieval.search import hybrid_search
+from app.voice.voice_sessionizer import format_timestamp
 
 
 # ---------------------------------------------------------------------------
@@ -87,6 +88,52 @@ def _apply_answer_provider(question: str, answer_text: str) -> str:
     if provider == "gemini":
         return _gemini_synthesize(question, answer_text)
     return _extractive_answer(question, answer_text)
+
+
+# ---------------------------------------------------------------------------
+# Voice citations: speaker + timestamp for voice-sourced chunks
+# ---------------------------------------------------------------------------
+
+def _distinct_speakers(segments: list[dict]) -> list[str]:
+    """Distinct speaker labels in first-appearance order (used by time-range)."""
+    seen: list[str] = []
+    for seg in segments:
+        name = (str(seg.get("speaker") or "")).strip()
+        if name and name not in seen:
+            seen.append(name)
+    return seen
+
+
+def _voice_chunk_source(chunk: Chunk) -> dict[str, Any]:
+    """Derive the voice citation fields ("Speaker 2, 04:12-04:38") for a chunk.
+
+    Reads the diarized segments this chunk was built from (chunks.voice_segments)
+    rather than re-parsing free text. Returns empty defaults for chunks that have
+    no segment metadata so retrieval never crashes on malformed rows.
+    """
+    segments = chunk.voice_segments or []
+    speakers: list[str] = []
+    for seg in segments:
+        name = (str(seg.get("speaker") or "")).strip()
+        if name and name not in speakers:
+            speakers.append(name)
+    starts = [float(seg.get("start", 0) or 0) for seg in segments]
+    ends = [float(seg.get("end", 0) or 0) for seg in segments]
+    seg_start = min(starts) if starts else None
+    seg_end = max(ends) if ends else None
+    primary = speakers[0] if speakers else None
+    segment = None
+    if primary is not None and seg_start is not None and seg_end is not None:
+        segment = (
+            f"{primary}, {format_timestamp(seg_start)}\u2013{format_timestamp(seg_end)}"
+        )
+    return {
+        "speakers": speakers,
+        "speaker": primary,
+        "segment_start": seg_start,
+        "segment_end": seg_end,
+        "segment": segment,
+    }
 
 
 # ---------------------------------------------------------------------------
@@ -239,10 +286,27 @@ def _answer_time_range(
         ).scalars().all()
     )
 
+    # Phase 3: also surface voice recordings uploaded within the range. The
+    # recordings.created_at time is the upload time (the closest proxy we store
+    # for "when the call happened"), so a "what did we decide on the call
+    # yesterday" question reaches voice chunks too.
+    recordings = list(
+        db.execute(
+            select(Recording)
+            .where(
+                Recording.chat_id == chat_id,
+                Recording.created_at >= start,
+                Recording.created_at <= end,
+            )
+            .order_by(Recording.created_at)
+        ).scalars().all()
+    )
+
     citations: list[dict[str, Any]] = []
     bullets: list[str] = []
+    sources: list[dict[str, Any]] = []
 
-    if not sessions:
+    if not sessions and not recordings:
         return (
             f"Nothing was found in the history for this chat between "
             f"{start:%Y-%m-%d %H:%M}Z and {end:%Y-%m-%d %H:%M}Z.",
@@ -250,7 +314,47 @@ def _answer_time_range(
             [],
         )
 
-    all_session_ids = []
+    # ---- voice recordings in range ----
+    for rec in recordings:
+        if rec.status != "done":
+            continue
+        raw = rec.raw_transcript_json or {}
+        segs = raw.get("segments") or [] if isinstance(raw.get("segments"), list) else []
+        speakers = _distinct_speakers(segs)
+        voices = [s for s in segs if isinstance(s, dict)]
+        previews = [
+            f"   – *\"{(s.get('text') or '')[:200]}\"* "
+            f"({s.get('speaker')}, {rec.created_at.strftime('%Y-%m-%d')})"
+            for s in voices[:3]
+        ]
+        duration = (
+            f"{rec.duration_seconds:.0f}s"
+            if rec.duration_seconds is not None
+            else "unknown length"
+        )
+        bullets.append(
+            f"• **Voice call** — {rec.created_at.strftime('%Y-%m-%d')}, "
+            f"{duration}, speakers: {', '.join(speakers) or 'unknown'}."
+        )
+        bullets.extend(previews)
+        sources.append(
+            {
+                "chunk_id": None,
+                "session_id": None,
+                "source_type": "voice",
+                "recording_id": str(rec.id),
+                "score": None,
+                "speaker": ", ".join(speakers) or None,
+                "segment_start": None,
+                "segment_end": None,
+                "segment": None,
+                "message_ids": [],
+                "content_preview": "/".join(
+                    (s.get("text") or "")[:200] for s in voices[:3]
+                ),
+            }
+        )
+
     for i, session in enumerate(sessions, start=1):
         msg_ids = [id_str for id_str in (session.message_ids or [])]
         if msg_ids:
@@ -277,13 +381,33 @@ def _answer_time_range(
                     "preview": preview,
                 }
             )
-        all_session_ids.append(str(session.id))
+        sources.append(
+            {
+                "chunk_id": None,
+                "session_id": str(session.id),
+                "source_type": "text",
+                "recording_id": None,
+                "score": None,
+                "speaker": None,
+                "segment_start": None,
+                "segment_end": None,
+                "segment": None,
+                "message_ids": msg_ids,
+                "content_preview": None,
+            }
+        )
 
+    counts = f"{len(sessions)} sessions" if sessions else "no text sessions"
+    if recordings:
+        # count only done recordings, matching the voice bullets emitted above
+        done = sum(1 for r in recordings if r.status == "done")
+        if done:
+            counts += f", {done} voice recording{'s' if done > 1 else ''}"
     header = (
         f"Here's what happened in this chat from {start:%Y-%m-%d} to {end:%Y-%m-%d} "
-        f"({len(sessions)} sessions):\n\n"
+        f"({counts}):\n\n"
     )
-    return header + "\n".join(bullets), citations, [{"session_id": s_id} for s_id in all_session_ids]
+    return header + "\n".join(bullets), citations, sources
 
 
 # ---------------------------------------------------------------------------
@@ -321,6 +445,35 @@ def _answer_semantic(
         chunk = chunks_by_id.get(chunk_id)
         if chunk is None:
             continue
+
+        if chunk.source_type == "voice":
+            # Voice chunk: cite the exact moment, not a message range.
+            voice = _voice_chunk_source(chunk)
+            segs = chunk.voice_segments or []
+            first_seg = next((s for s in segs if (s.get("text") or "").strip()), None)
+            preview = (first_seg.get("text") or chunk.content or "")[:250]
+            speaker_ref = voice["segment"] or voice["speaker"] or "unknown"
+            bullets.append(
+                f"[{rank}] *\"{preview}\"* "
+                f"— {speaker_ref}, score: {score_map.get(chunk_id, 0):.3f}"
+            )
+            source_list.append(
+                {
+                    "chunk_id": chunk_id,
+                    "session_id": None,
+                    "source_type": "voice",
+                    "recording_id": str(chunk.recording_id) if chunk.recording_id else None,
+                    "score": score_map.get(chunk_id, 0.0),
+                    "speaker": voice["speaker"],
+                    "segment_start": voice["segment_start"],
+                    "segment_end": voice["segment_end"],
+                    "segment": voice["segment"],
+                    "message_ids": [],
+                    "content_preview": (chunk.content or "")[:500],
+                }
+            )
+            continue
+
         source_msgs = []
         if chunk.message_ids:
             source_msgs = db.execute(
@@ -352,6 +505,8 @@ def _answer_semantic(
             {
                 "chunk_id": chunk_id,
                 "session_id": str(chunk.session_id),
+                "source_type": "text",
+                "recording_id": None,
                 "score": score_map.get(chunk_id, 0.0),
                 "message_ids": chunk.message_ids or [],
                 "content_preview": (chunk.content or "")[:500],

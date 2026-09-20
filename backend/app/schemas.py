@@ -78,13 +78,25 @@ class Citation(BaseModel):
 
 
 class AnswerSource(BaseModel):
-    """Retrieval source: which chunk/session/messages the answer pulled from."""
+    """Retrieval source: which chunk/session/messages the answer pulled from.
+
+    Text chunks carry ``session_id``/``message_ids``; voice chunks (Phase 3)
+    carry ``source_type="voice"`` with ``recording_id`` plus the speaker and
+    segment time range of the exact moment cited (e.g. "Speaker 2, 04:12-04:38").
+    """
 
     chunk_id: str | None = None
     session_id: str | None = None
     score: float | None = None
     message_ids: list[str] = []
     content_preview: str | None = None
+    # --- voice (Phase 3) ---
+    source_type: str | None = None  # "text" | "voice" (None up to 2026-09-20)
+    recording_id: str | None = None
+    speaker: str | None = None
+    segment_start: float | None = None  # seconds into the recording
+    segment_end: float | None = None
+    segment: str | None = None  # formatted "Speaker 2, 04:12-04:38"
 
 
 class AnswerResponse(BaseModel):
@@ -96,3 +108,37 @@ class AnswerResponse(BaseModel):
     answer_text: str
     citations: list[Citation] = []
     sources: list[AnswerSource] = []
+
+
+# --- Phase 3: voice ------------------------------------------------------------
+
+class RecordingRead(BaseModel):
+    """A `recordings` row as returned by GET /voice/recordings."""
+
+    model_config = ConfigDict(from_attributes=True)
+
+    id: UUID
+    chat_id: str
+    uploaded_by: str | None
+    original_filename: str
+    mime_type: str
+    sha256: str
+    duration_seconds: float | None
+    status: str
+    raw_transcript_json: dict | None
+    error: str | None
+    created_at: datetime
+
+
+class VoiceUploadResponse(BaseModel):
+    """POST /voice/upload progress summary (returned for both fresh + duplicate)."""
+
+    recording_id: str
+    chat_id: str
+    status: str  # done | failed
+    duplicate: bool  # True when an identical file (sha256) was already stored
+    duration_seconds: float | None
+    speakers: list[str]
+    chunk_count: int
+    original_filename: str
+    uploaded_by: str | None

@@ -14,11 +14,11 @@ via a ``chat_id`` filter that callers can narrow by session range before calling
 import logging
 from typing import Any
 
-from sqlalchemy import func, select
+from sqlalchemy import and_, func, or_, select
 from sqlalchemy.orm import Session
 
 from app.config import settings
-from app.models import Chunk, Session as ChatSession
+from app.models import Chunk, Recording, Session as ChatSession
 
 logger = logging.getLogger(__name__)
 
@@ -27,6 +27,23 @@ def _fts_condition(query: str):
     """plainto_tsquery handles unaccented English well enough for group chat."""
     return func.to_tsvector("english", Chunk.content).op("@@")(
         func.plainto_tsquery("english", query)
+    )
+
+
+def _chunk_scope(chat_id: str):
+    """Single scope predicate covering BOTH source types of the chunks table.
+
+    A chunk is retrievable when it belongs to this chat either as a text chunk
+    (parent `sessions` row carries chat_id) or a voice chunk (parent `recordings`
+    row carries chat_id). There is deliberately no per-source branching here:
+    voice and text chunks are ordinary rows in `chunks`, so both queries below
+    just LEFT JOIN the two parents and apply this one predicate - which also
+    guarantees no half-finished row (a chunk with neither FK set) ever leaks into
+    retrieval results.
+    """
+    return or_(
+        and_(Chunk.session_id.isnot(None), ChatSession.chat_id == chat_id),
+        and_(Chunk.recording_id.isnot(None), Recording.chat_id == chat_id),
     )
 
 
@@ -39,17 +56,16 @@ def vector_search(
 ) -> list[tuple[str, float]]:
     """Top-k nearest neighbors by cosine distance over the chunk embedding column.
 
-    Returns [(chunk_id_str, similarity_score)] sorted descending.
+    Returns [(chunk_id_str, similarity_score)] sorted descending. Includes text
+    AND voice chunks for the chat via ``_chunk_scope``.
     """
     distance = Chunk.embedding.cosine_distance(qvec)
     score_expr = (1 - distance).label("score")
     stmt = (
         select(Chunk.id.label("id"), score_expr)
-        .join(ChatSession, Chunk.session_id == ChatSession.id)
-        .where(
-            ChatSession.chat_id == chat_id,
-            Chunk.session_id.isnot(None),
-        )
+        .join(ChatSession, Chunk.session_id == ChatSession.id, isouter=True)
+        .join(Recording, Chunk.recording_id == Recording.id, isouter=True)
+        .where(_chunk_scope(chat_id))
         .order_by(distance)
         .limit(k)
     )
@@ -67,6 +83,7 @@ def keyword_search(
 
     ts_rank_cd scores by proximity; results are the best-matching ranked documents
     from the FTS index. Returns [(chunk_id_str, rank_score)] sorted descending.
+    Includes text AND voice chunks for the chat via ``_chunk_scope``.
     """
     query = query.strip()
     if not query:
@@ -75,15 +92,20 @@ def keyword_search(
     cd = func.ts_rank_cd(
         func.to_tsvector("english", Chunk.content),
         func.plainto_tsquery("english", query),
-        normalization=32,  # rank_cd normalization by document length
+        # rank_cd normalization by document length.
+        # Passed POSITIONALLY: Postgres ts_rank_cd(vector, query, normalization)
+        # does not accept a `normalization=` keyword through SQLAlchemy's generic
+        # func (it raises TypeError at statement-build time), so this is the form
+        # that actually reaches Postgres. 32 == rank / (rank + 1).
+        32,
     ).label("score")
 
     stmt = (
         select(Chunk.id.label("id"), cd)
-        .join(ChatSession, Chunk.session_id == ChatSession.id)
+        .join(ChatSession, Chunk.session_id == ChatSession.id, isouter=True)
+        .join(Recording, Chunk.recording_id == Recording.id, isouter=True)
         .where(
-            ChatSession.chat_id == chat_id,
-            Chunk.session_id.isnot(None),
+            _chunk_scope(chat_id),
             _fts_condition(query),
         )
         .order_by(cd.desc())

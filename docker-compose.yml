@@ -82,6 +82,14 @@ services:
       RETRIEVAL_TOP_K: ${RETRIEVAL_TOP_K:-6}
       RETRIEVAL_RRF_K: ${RETRIEVAL_RRF_K:-60}
       EXPORT_BOT_NAME: ${EXPORT_BOT_NAME:-}
+      # Phase 3: Gemini providers (embeddings/answers/transcription) + voice.
+      GEMINI_API_KEY: ${GEMINI_API_KEY:-}
+      ANSWER_PROVIDER: ${ANSWER_PROVIDER:-extractive}
+      ANSWER_MODEL: ${ANSWER_MODEL:-gemini-2.5-flash}
+      TRANSCRIBE_MODEL: ${TRANSCRIBE_MODEL:-gemini-2.5-flash}
+      TRANSCRIBE_WINDOW_SECONDS: ${TRANSCRIBE_WINDOW_SECONDS:-1800}
+      VOICE_MAX_UPLOAD_BYTES: ${VOICE_MAX_UPLOAD_BYTES:-209715200}
+      VOICE_SEGMENTS_PER_CHUNK: ${VOICE_SEGMENTS_PER_CHUNK:-50}
     depends_on:
       postgres:
         condition: service_healthy

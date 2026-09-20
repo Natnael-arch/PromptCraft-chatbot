@@ -75,6 +75,29 @@ class Settings(BaseSettings):
     # messages in the export).
     export_bot_name: str = ""
 
+    # --- Voice transcription (Phase 3) ---
+    # Gemini model used to transcribe audio. As of 2026 the gemini-2.5-flash tier
+    # accepts audio directly and supports structured output, with a per-prompt
+    # limit of roughly 8.4 hours (~1M tokens; 32 tokens/second) and a single audio
+    # file per request. Supported MIME types include audio/ogg (covers WhatsApp's
+    # Ogg-Opus voice notes), audio/mpeg, audio/mp3, audio/m4a, audio/wav,
+    # audio/x-aac, audio/flac, audio/webm, audio/pcm. Re-verify these limits before
+    # changing the model tier - they drift between releases.
+    transcribe_model: str = "gemini-2.5-flash"
+    # Recordings longer than this many seconds are transcribed in fixed windows
+    # (each well under the ~8.4h single-request cap) so structured JSON output
+    # stays reliable on very long tracks. Segment timestamps are kept on the
+    # recording's own timeline and merged back into one continuous transcript.
+    transcribe_window_seconds: int = 1800
+    # Max multipart upload size for voice files. Gemini's own input limit is 500MB
+    # and inline (non-Files-API) requests are capped at 20MB, above which
+    # transcriber.py goes through the Files API - so this cap is a dev-sanity bound.
+    voice_max_upload_bytes: int = 200 * 1024 * 1024
+    # Max speaker turns packed into one voice chunk before flushing, mirroring
+    # Phase 2's session_max_messages hard cap for text sessions (chunks also stay
+    # under session_max_chunk_chars, the shared char budget).
+    voice_segments_per_chunk: int = 50
+
     model_config = SettingsConfigDict(
         env_file=".env", env_file_encoding="utf-8", extra="ignore"
     )

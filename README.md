@@ -266,6 +266,30 @@ via the request parameter, not via client-side slicing.
    `citations` (message-level) and `sources` (chunk/session-level) are always
    attached.
 
+### Voice ingestion (Phase 3, `POST /voice/upload`)
+
+A voice note / call recording is uploaded as multipart (`file`, `chat_id`,
+optional `uploaded_by`), transcribed by Gemini's native audio understanding with
+speaker labels + MM:SS timestamps, chunked with the same context-header treatment
+and char budget as text sessions, and embedded through the **same** embedder into
+the **same** `chunks` table (`source_type='voice'`, `recording_id` instead of
+`session_id`). `/ask` picks voice chunks up automatically — no route branching.
+
+| Setting | Default | Meaning |
+| ------- | ------- | ------- |
+| `TRANSCRIBE_MODEL` | `gemini-2.5-flash` | Audio-native transcription model. |
+| `TRANSCRIBE_WINDOW_SECONDS` | `1800` | Long recordings are transcribed in windows this size and merged onto one timeline. |
+| `VOICE_MAX_UPLOAD_BYTES` | `209715200` | Upload cap; files >20MB use the Gemini Files API. |
+| `VOICE_SEGMENTS_PER_CHUNK` | `50` | Speaker turns per voice chunk (mirrors `SESSION_MAX_MESSAGES`). |
+
+Accepted formats: WhatsApp `.ogg`/`.opus`, `.mp3`, `.m4a`, `.wav`, `.webm`.
+Re-uploading an identical file (sha256 match) returns the existing recording
+without re-transcribing. A transcription that comes back malformed is stored as
+`status=failed` with the raw Gemini response in `raw_transcript_json` — audio is
+never silently dropped. Voice answers cite the moment, e.g. `"Speaker 2, 04:12–04:38"`,
+via the `sources` array. Requires `GEMINI_API_KEY`; there is no offline mock for
+audio understanding. Debug with `GET /voice/recordings?chat_id=&limit=`.
+
 ---
 
 ## 6. Troubleshooting

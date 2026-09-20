@@ -2,7 +2,7 @@ import uuid
 from datetime import datetime
 
 from pgvector.sqlalchemy import Vector
-from sqlalchemy import Boolean, DateTime, ForeignKey, Text, func, text
+from sqlalchemy import Boolean, DateTime, Float, ForeignKey, Text, func, text
 from sqlalchemy.dialects.postgresql import JSONB, UUID
 from sqlalchemy.orm import Mapped, mapped_column
 
@@ -100,6 +100,44 @@ class Session(Base):
     )
 
 
+class Recording(Base):
+    """One uploaded voice note / call recording (Phase 3).
+
+    Voice notes bypass the `messages`/`sessions` tables entirely: the raw bytes
+    are hashed (sha256) for idempotent re-uploads, transcribed via Gemini, and
+    the diarized transcript is stored here as raw_transcript_json so chunks can be
+    re-built without re-transcribing. The transcription pipeline never drops a
+    failing response: status is set to "failed" with the raw response preserved
+    for debugging.
+    """
+
+    __tablename__ = "recordings"
+
+    id: Mapped[uuid.UUID] = mapped_column(
+        UUID(as_uuid=True),
+        primary_key=True,
+        default=uuid.uuid4,
+        server_default=text("gen_random_uuid()"),
+    )
+    chat_id: Mapped[str] = mapped_column(Text, index=True)
+    uploaded_by: Mapped[str | None] = mapped_column(Text, nullable=True)
+    original_filename: Mapped[str] = mapped_column(Text)
+    mime_type: Mapped[str] = mapped_column(Text)
+    # sha256 of the uploaded audio bytes - idempotency key. Re-uploading the same
+    # file returns the existing row instead of re-transcribing.
+    sha256: Mapped[str] = mapped_column(Text, unique=True, index=True)
+    duration_seconds: Mapped[float | None] = mapped_column(Float, nullable=True)
+    # pending / transcribing / done / failed
+    status: Mapped[str] = mapped_column(Text, default="pending", server_default="pending")
+    # Full Gemini diarized transcript response ({segments: [...]}), kept verbatim
+    # so chunks can be re-sessionized without a second transcription call.
+    raw_transcript_json: Mapped[dict | None] = mapped_column(JSONB, nullable=True)
+    error: Mapped[str | None] = mapped_column(Text, nullable=True)
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), server_default=func.now()
+    )
+
+
 class Chunk(Base):
     """A retrievable unit of group history: one embedded text span (Phase 2).
 
@@ -133,6 +171,21 @@ class Chunk(Base):
     )
     # UUIDs of the Messages whose text is embedded in this chunk.
     message_ids: Mapped[list | None] = mapped_column(JSONB, nullable=True)
+    # Phase 3 voice: a chunk either belongs to a text session (session_id) or a
+    # voice recording (recording_id). source_type distinguishes the two so hybrid
+    # retrieval can pull from both halves of the same chunks table.
+    source_type: Mapped[str] = mapped_column(
+        Text, default="text", server_default="text"
+    )
+    recording_id: Mapped[uuid.UUID | None] = mapped_column(
+        ForeignKey("recordings.id", ondelete="CASCADE"),
+        index=True,
+        nullable=True,
+    )
+    # For voice chunks: the [speaker, start, end, text] segments this chunk was
+    # built from, so selections can cite the exact moment ("Speaker 2, 04:12-04:38")
+    # instead of a session message range.
+    voice_segments: Mapped[list | None] = mapped_column(JSONB, nullable=True)
     content: Mapped[str] = mapped_column(Text)
     embedding: Mapped[list] = mapped_column(Vector(1024))
     created_at: Mapped[datetime] = mapped_column(
