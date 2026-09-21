@@ -88,16 +88,18 @@ def send_text(
             client.close()
 
 
-def fetch_session_me_id(
+def fetch_session_me(
     *,
     session: str | None = None,
     client: httpx.Client | None = None,
-) -> str | None:
-    """Return the bot's own JID (``me.id``) from a WAHA session, or None.
+) -> dict | None:
+    """Return the WAHA ``me`` object for a session: {"id", "lid", "pushName", ...}.
 
-    Safe on missing/unpaired sessions: returns None instead of raising so the
-    worker can fall back gracefully (group mentions become no-ops until the
-    session is paired).
+    ``id`` is the phone JID (``251947711181@c.us``) and ``lid`` the account's
+    linked-device identity (``30727051714790@lid``) - both are needed to match
+    group @-mentions. Safe on missing/unpaired sessions: returns None instead of
+    raising so the worker can fall back gracefully (group mentions become no-ops
+    until the session is paired).
     """
     session_name = session or settings.waha_session
     owns_client = client is None
@@ -106,7 +108,7 @@ def fetch_session_me_id(
     try:
         response = client.get(WAHA_SESSIONS_PATH)
         if response.status_code >= 400:
-            logger.warning("Cannot resolve bot JID: WAHA /api/sessions HTTP %s", response.status_code)
+            logger.warning("Cannot resolve bot identity: WAHA /api/sessions HTTP %s", response.status_code)
             return None
         sessions = response.json()
         if not isinstance(sessions, list):
@@ -117,12 +119,11 @@ def fetch_session_me_id(
             if str(entry.get("name") or entry.get("id") or "") != session_name:
                 continue
             me = entry.get("me") or {}
-            me_id = (me.get("id") or "").strip()
-            if me_id:
-                return me_id
+            if (me.get("id") or "").strip():
+                return me
         return None
     except httpx.HTTPError as exc:
-        logger.warning("Cannot resolve bot JID from WAHA sessions: %s", exc)
+        logger.warning("Cannot resolve bot identity from WAHA sessions: %s", exc)
         return None
     finally:
         if owns_client:

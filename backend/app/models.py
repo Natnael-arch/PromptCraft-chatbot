@@ -100,6 +100,77 @@ class Session(Base):
     )
 
 
+class ChatIngestState(Base):
+    """Durable per-chat cursor for the incremental live-ingest pipeline (Phase 4).
+
+    One row per chat that has ever had a webhook-captured message run through the
+    live ingest path. ``last_message_id`` is the most recent `messages` row the
+    chat's sessions/chunks have been rebuilt against - the next trigger skips the
+    rebuild entirely when nothing is newer, so active groups don't re-embed their
+    whole history on every single message. ``last_rebuilt_at`` is informational
+    (monitoring / debugging); the cooldown decision uses the in-memory clock.
+    """
+
+    __tablename__ = "chat_ingest_state"
+
+    chat_id: Mapped[str] = mapped_column(Text, primary_key=True)
+    last_message_id: Mapped[uuid.UUID | None] = mapped_column(
+        ForeignKey("messages.id", ondelete="SET NULL"), nullable=True
+    )
+    last_rebuilt_at: Mapped[datetime | None] = mapped_column(
+        DateTime(timezone=True), nullable=True
+    )
+
+
+class ChatSetting(Base):
+    """Per-chat runtime settings (Phase 5/6: the /unhinged_* toggle).
+
+    One row per chat that has ever had an explicit override set via a slash
+    command. ``unhinged_enabled`` is a tri-state:
+
+    * ``True``  - casual/banter replies are ON in this chat regardless of the
+      global ``BANTER_MODE_ENABLED`` env default.
+    * ``False`` - casual/banter replies are OFF in this chat (knowledge path
+      only), regardless of the global default.
+    * ``NULL``  - fall back to ``settings.banter_mode_enabled``.
+
+    No row at all is treated the same as NULL (reading never creates a row, so
+    untouched chats simply use the global default).
+    """
+
+    __tablename__ = "chat_settings"
+
+    chat_id: Mapped[str] = mapped_column(Text, primary_key=True)
+    unhinged_enabled: Mapped[bool | None] = mapped_column(Boolean, nullable=True)
+    updated_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), server_default=func.now()
+    )
+
+
+class TrustedSender(Base):
+    """A sender whose content is weighted higher in retrieval/citations (Phase 5).
+
+    Announcers/leads post the authoritative updates in a hackathon group
+    (deadlines, submission links, judging criteria). Retrieval multiplies the
+    relevance score of chunks containing their messages by ``weight`` (default
+    2.0, so an announcement chunk can outrank a topically-closer casual mention),
+    and citations from them carry ``is_announcement`` + ``role_label`` so the
+    answer visibly flags the source as an announcement rather than small talk.
+
+    ``sender_id`` matches ``Message.sender_id`` (a WhatsApp JID).
+    """
+
+    __tablename__ = "trusted_senders"
+
+    sender_id: Mapped[str] = mapped_column(Text, primary_key=True)
+    display_name: Mapped[str | None] = mapped_column(Text, nullable=True)
+    role_label: Mapped[str] = mapped_column(Text, default="announcer", server_default="announcer")
+    weight: Mapped[float] = mapped_column(Float, default=2.0, server_default="2.0")
+    added_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), server_default=func.now()
+    )
+
+
 class Recording(Base):
     """One uploaded voice note / call recording (Phase 3).
 

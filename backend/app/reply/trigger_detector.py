@@ -17,6 +17,12 @@ remains after the strip (mention-only message), the caller replies with the shor
 
 Own (``fromMe``) messages are always ignored: without this guard the bot would
 answer its own replies forever.
+
+Note on current NOWEB behavior (verified from a live paired session): group
+@-mentions of the bot arrive with the LID in ``mentionedJid`` (``30727051714790@lid``)
+and render in the body as ``@30727051714790`` - the phone number never appears.
+Match against the lid as well as the phone number (``bot_aliases``), and only
+count body mentions whose digits are actually ours.
 """
 
 import re
@@ -55,7 +61,53 @@ def _digits(jid: str | None) -> str:
     return re.sub(r"\D", "", jid)
 
 
-_MENTION_BODY_RE = re.compile(r"@(?P<digits>\d{6,})\b")
+def resolve_chat_id(payload: dict) -> str | None:
+    """The chat/group JID a reply should go to, from a WAHA message payload.
+
+    Inbound messages carry it in ``from`` (contact JID for 1:1, group JID for
+    groups); outbound (bot's own) messages carry it in ``to``. Shared by the
+    @-mention detection and the slash-command path so the two never disagree on
+    where a reply belongs.
+    """
+    return _normalize_jid(payload.get("from") or payload.get("to"))
+
+
+def resolve_sender_id(payload: dict) -> str | None:
+    """The author's JID for a message, matching ``messages.sender_id``.
+
+    Group messages name their author in ``participant``; 1:1 messages have no
+    participant, so the author is the ``from`` JID. Used by the trusted-sender
+    lockdown of the /unhinged_* commands (commands are never from_me, so this
+    deliberately ignores the bot's own identity).
+    """
+    return _normalize_jid(payload.get("participant") or payload.get("from"))
+
+
+# Slash commands recognized BEFORE any mention/DM gating. A bare command in a
+# group - with no @-mention of the bot - must still work. Values are the
+# canonical command names the reply worker switches on.
+SLASH_COMMANDS = {
+    "/unhinged_on": "unhinged_on",
+    "/unhinged_off": "unhinged_off",
+}
+
+
+def detect_command(payload: dict) -> str | None:
+    """Return the command name when the raw body is a known slash command.
+
+    Matches the trimmed, case-insensitive body against the fixed command set
+    ("/Unhinged_ON", " /unhinged_on " etc. all resolve to the same command);
+    anything else - including a command buried inside a longer sentence - is
+    None. The bot's own messages are ignored so a loop can never toggle itself.
+    """
+    if bool(payload.get("fromMe")):
+        return None
+    body = payload.get("body")
+    text = str(body).strip() if body is not None else ""
+    return SLASH_COMMANDS.get(text.lower())
+
+
+_MENTION_DIGITS_RE = re.compile(r"@(\d{6,})")
 
 
 def _is_group(payload: dict) -> bool:
@@ -105,12 +157,18 @@ def strip_mention(body: str, bot_jid: str | None) -> str:
 
 # ---------------------------------------------------------------- detection
 
-def detect_reply(payload: dict, bot_jid: str | None) -> Detection:
+def detect_reply(payload: dict, bot_jid: str | None, bot_aliases: set[str] | None = None) -> Detection:
     """Classify an incoming WAHA message payload against the trigger rules.
 
     ``bot_jid`` is the bot's own WhatsApp JID (``1555...@c.us``) or None when it
     has not been configured / discovered yet - group mention detection silently
     degrades to no-op in that case.
+
+    ``bot_aliases`` is the set of digit-strings the bot can be mentioned under.
+    As of NOWEB 2026.x, group @-mentions of an account surface the LID (e.g.
+    ``30727051714790@lid``) rather than the phone JID in both ``mentionedJid``
+    and the rendered ``@<digits>`` body text, so identity must cover both the
+    phone number and the lid. Defaults to the phone digits when omitted.
     """
     if bool(payload.get("fromMe")):
         # Loop guard: never answer our own messages (each reply would otherwise
@@ -122,7 +180,7 @@ def detect_reply(payload: dict, bot_jid: str | None) -> Detection:
     is_group = _is_group(payload)
     # Reply goes to the chat that asked: `from` for inbound 1:1 (contact JID),
     # the group JID for group messages (`to`/`from` both carry it there).
-    chat_id = _normalize_jid(payload.get("from") or payload.get("to"))
+    chat_id = resolve_chat_id(payload)
 
     if not is_group:
         if not chat_id or not chat_id.endswith(("@c.us", "@s.whatsapp.net")):
@@ -135,7 +193,10 @@ def detect_reply(payload: dict, bot_jid: str | None) -> Detection:
 
     # ---- group ----
     bot_digits = _digits(bot_jid)
-    if not bot_digits:
+    aliases = set(bot_aliases or set())
+    if bot_digits:
+        aliases.add(bot_digits)
+    if not aliases:
         return Detection(
             False,
             None,
@@ -146,10 +207,12 @@ def detect_reply(payload: dict, bot_jid: str | None) -> Detection:
         )
 
     mentions = extract_mentioned_jids(payload)
-    mentioned_bot = any(_digits(jid) == bot_digits for jid in mentions)
+    mentioned_bot = any(_digits(jid) in aliases for jid in mentions)
     if not mentioned_bot:
-        # fallback: search the body for "@<bot-digits>" (works pre-pairing)
-        mentioned_bot = bool(_MENTION_BODY_RE.search(body_text))
+        # fallback: the rendered text carries "@<digits>" for the mentioned
+        # contact. Only count it when the digits are actually ours (a generic
+        # "@anyone" mention must not trigger the bot).
+        mentioned_bot = any(d in aliases for d in _MENTION_DIGITS_RE.findall(body_text))
 
     if not mentioned_bot:
         return Detection(False, None, None, False, True, "group message without bot mention")

@@ -96,6 +96,15 @@ services:
       BOT_WHATSAPP_ID: ${BOT_WHATSAPP_ID:-}
       REPLY_COOLDOWN_SECONDS: ${REPLY_COOLDOWN_SECONDS:-30}
       REPLY_MAX_CHARS: ${REPLY_MAX_CHARS:-4000}
+      # Phase 4 live ingest: debounced auto-rebuild of sessions/chunks for chats
+      # that receive webhook messages. INGEST_AUTO_ENABLED=false disables it.
+      INGEST_DEBOUNCE_SECONDS: ${INGEST_DEBOUNCE_SECONDS:-45}
+      INGEST_AUTO_ENABLED: ${INGEST_AUTO_ENABLED:-true}
+      # Phase 5: admin routes + casual/banter mode.
+      ADMIN_TOKEN: ${ADMIN_TOKEN:-}
+      BANTER_MODE_ENABLED: ${BANTER_MODE_ENABLED:-true}
+      UNHINGED_TOGGLE_RESTRICTED_TO_TRUSTED: ${UNHINGED_TOGGLE_RESTRICTED_TO_TRUSTED:-false}
+      KNOWLEDGE_INTENT_KEYWORDS: ${KNOWLEDGE_INTENT_KEYWORDS:-}
     depends_on:
       postgres:
         condition: service_healthy

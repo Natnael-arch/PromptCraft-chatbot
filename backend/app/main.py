@@ -5,6 +5,7 @@ from fastapi import FastAPI
 from sqlalchemy import text
 
 from app.db import engine
+from app.routes_admin import router as admin_router
 from app.routes_ask import router as ask_router
 from app.routes_debug import router as debug_router
 from app.routes_ingest import router as ingest_router
@@ -44,6 +45,7 @@ app.include_router(debug_router)
 app.include_router(ingest_router)
 app.include_router(ask_router)
 app.include_router(voice_router)
+app.include_router(admin_router)
 
 
 @app.get("/")

@@ -27,7 +27,7 @@ from sqlalchemy import select
 from sqlalchemy.orm import Session
 
 from app.config import settings
-from app.models import Chunk, Message, Recording, Session as ChatSession
+from app.models import Chunk, Message, Recording, Session as ChatSession, TrustedSender
 from app.retrieval.search import hybrid_search
 from app.voice.voice_sessionizer import format_timestamp
 
@@ -134,6 +134,63 @@ def _voice_chunk_source(chunk: Chunk) -> dict[str, Any]:
         "segment_end": seg_end,
         "segment": segment,
     }
+
+
+# ---------------------------------------------------------------------------
+# Phase 5: trusted-sender citation labeling. Announcers/leads are flagged in
+# citations so a reader can see at a glance that a source was an official
+# announcement rather than a passing comment. Both answer builders (semantic +
+# time-range) share these helpers so the two paths never diverge.
+# ---------------------------------------------------------------------------
+
+def _trusted_labels(db: Session) -> dict[str, dict[str, str | None]]:
+    """sender_id -> {"display_name", "role_label"} from trusted_senders.
+
+    Called once per answer; the table is tiny and PK-scoped by sender_id.
+    """
+    rows = db.execute(select(TrustedSender)).scalars().all()
+    return {
+        t.sender_id: {"display_name": t.display_name, "role_label": t.role_label}
+        for t in rows
+    }
+
+
+def _cite_message(
+    m: Message,
+    chat_id: str,
+    trusted: dict[str, dict[str, str | None]],
+) -> dict[str, Any]:
+    """Structured citation for one message, carrying its trust annotation.
+
+    ``is_announcement``/``role_label`` are True/set when ``m.sender_id`` is a
+    trusted sender; ``sender_id`` is included so clients can link the citation
+    back to the trusted_senders table without another lookup.
+    """
+    label = trusted.get(m.sender_id)
+    return {
+        "message_id": str(m.id),
+        "sender_name": m.sender_name,
+        "timestamp": m.timestamp.isoformat() if m.timestamp else None,
+        "chat_id": chat_id,
+        "chat_name": m.chat_name,
+        "preview": (m.body or "")[:250],
+        "sender_id": m.sender_id,
+        "is_announcement": bool(label),
+        "role_label": label["role_label"] if label else None,
+    }
+
+
+def _sender_label(m: Message | None, trusted: dict[str, dict[str, str | None]]) -> str:
+    """Bullet-name for a message: display-name/role for trusted senders, else JID.
+
+    Trusted senders render as "📢 [Amina, announcer]" instead of a bare pushname,
+    so the announcement flag survives even in the raw extractive bullet text.
+    """
+    label = trusted.get(m.sender_id) if m is not None else None
+    if label:
+        name = label["display_name"] or m.sender_name or "unknown"
+        return f"📢 [{name}, {label['role_label']}]"
+    return (m.sender_name if m is not None else None) or "unknown"
 
 
 # ---------------------------------------------------------------------------
@@ -314,6 +371,8 @@ def _answer_time_range(
             [],
         )
 
+    trusted = _trusted_labels(db)
+
     # ---- voice recordings in range ----
     for rec in recordings:
         if rec.status != "done":
@@ -369,18 +428,9 @@ def _answer_time_range(
         )
         for m in sample_msgs:
             preview = (m.body or "").replace("\n", " ")[:200]
-            bullet = f"   – *\"{preview}\"* ({m.sender_name}, {m.timestamp.strftime('%Y-%m-%d %H:%M') if m.timestamp else 'unknown'})"
+            bullet = f"   – *\"{preview}\"* ({_sender_label(m, trusted)}, {m.timestamp.strftime('%Y-%m-%d %H:%M') if m.timestamp else 'unknown'})"
             bullets.append(bullet)
-            citations.append(
-                {
-                    "message_id": str(m.id),
-                    "sender_name": m.sender_name,
-                    "timestamp": m.timestamp.isoformat() if m.timestamp else None,
-                    "chat_id": chat_id,
-                    "chat_name": m.chat_name,
-                    "preview": preview,
-                }
-            )
+            citations.append(_cite_message(m, chat_id, trusted))
         sources.append(
             {
                 "chunk_id": None,
@@ -441,6 +491,8 @@ def _answer_semantic(
     source_list: list[dict[str, Any]] = []
     bullets: list[str] = []
 
+    trusted = _trusted_labels(db)
+
     for rank, chunk_id in enumerate(chunk_ids, start=1):
         chunk = chunks_by_id.get(chunk_id)
         if chunk is None:
@@ -486,21 +538,12 @@ def _answer_semantic(
         preview = (preview_msg.body or "").replace("\n", " ")[:250] if preview_msg else (chunk.content or "")[:250]
         bullets.append(
             f"[{rank}] *\"{preview}\"* "
-            f"— {preview_msg.sender_name}, {preview_msg.timestamp.strftime('%Y-%m-%d') if preview_msg and preview_msg.timestamp else 'unknown date'}, "
+            f"— {_sender_label(preview_msg, trusted)}, {preview_msg.timestamp.strftime('%Y-%m-%d') if preview_msg and preview_msg.timestamp else 'unknown date'}, "
             f"score: {score_map.get(chunk_id, 0):.3f}"
         )
         for m in source_msgs:
             if m.body:
-                citations.append(
-                    {
-                        "message_id": str(m.id),
-                        "sender_name": m.sender_name,
-                        "timestamp": m.timestamp.isoformat() if m.timestamp else None,
-                        "chat_id": chat_id,
-                        "chat_name": m.chat_name,
-                        "preview": (m.body or "")[:250],
-                    }
-                )
+                citations.append(_cite_message(m, chat_id, trusted))
         source_list.append(
             {
                 "chunk_id": chunk_id,
@@ -559,3 +602,95 @@ def answer_question(
         "citations": citations,
         "sources": sources,
     }
+
+
+# ---------------------------------------------------------------------------
+# 6. Casual/banter mode (Phase 5). A second, lighter personality for the group:
+# jokes and nonsense get a short in-character reply instead of being force-fed
+# through retrieval. The retrieval/answer code above is untouched - reply_worker
+# routes here only after classify_intent() says "banter".
+# ---------------------------------------------------------------------------
+
+BANTER_FALLBACK = "lol"
+
+_BANTER_SYSTEM_PROMPT = (
+    "You are replying inside a real WhatsApp group chat among real people in a "
+    "hackathon cohort. Your tone here is playful, witty, occasionally sarcastic \u2014 "
+    "like a clever group member, not a customer support bot.\n"
+    "- Never make a joke that targets, mocks, or singles out a specific named "
+    "person in the group, even lightly. General, self-deprecating, or absurdist "
+    "humor only.\n"
+    "- Never joke about anything outside this program's context \u2014 no political, "
+    "religious, or otherwise sensitive topics. When in doubt, keep it about the "
+    "hackathon, coding, deadlines, chat culture, or something absurd and unrelated "
+    "to anyone present.\n"
+    "- Keep it short \u2014 one or two sentences, this is a chat message not a monologue.\n"
+    "- You are NOT answering a factual question here; do not state anything as fact "
+    "about the program, deadlines, or announcements even in jest. If the message "
+    "actually seems to be a real question in disguise, say so lightly and suggest "
+    "they ask directly instead of guessing.\n"
+)
+
+
+def get_recent_context(db: Session, chat_id: str, limit: int = 15) -> str:
+    """Chronological "Sender: message" lines from the chat's raw message history.
+
+    Used ONLY to give banter mode a sense of the room (tone/context). It comes
+    straight from `messages`, deliberately bypassing retrieval, and is not a
+    source of facts - the banter system prompt states exactly that.
+    """
+    rows = db.execute(
+        select(Message)
+        .where(
+            Message.chat_id == chat_id,
+            Message.body.isnot(None),
+            Message.body != "",
+        )
+        .order_by(Message.created_at.desc())
+        .limit(limit)
+    ).scalars().all()
+    lines = []
+    for m in reversed(rows):
+        speaker = m.sender_name or m.sender_id or "unknown"
+        lines.append(f"{speaker}: {m.body}")
+    return "\n".join(lines)
+
+
+def _banter_reply(question: str, recent_context: str) -> str:
+    """One/two-sentence in-character reply for a non-knowledge message.
+
+    Mirrors the defensive shape of ``_gemini_synthesize``: no key, missing SDK,
+    or any API failure drops to ``BANTER_FALLBACK`` ("lol") so a stuck group can
+    never stop the bot, and the fallback is deliberately never an apology.
+    """
+    api_key = settings.gemini_api_key
+    if not api_key:
+        return BANTER_FALLBACK
+    try:
+        from google import genai
+        from google.genai import types as genai_types
+    except ImportError:
+        return BANTER_FALLBACK
+
+    prompt = (
+        _BANTER_SYSTEM_PROMPT
+        + "\n"
+        "Recent chat (for tone/context only \u2014 NEVER quote or state anything from "
+        "here as fact):\n"
+        f"{recent_context or '(nothing yet)'}\n\n"
+        f"LATEST MESSAGE: {question}\n\n"
+        "YOUR REPLY:"
+    )
+    try:
+        client = genai.Client(api_key=api_key)
+        response = client.models.generate_content(
+            model=settings.answer_model,
+            contents=prompt,
+            config=genai_types.GenerateContentConfig(
+                temperature=0.9,
+                max_output_tokens=120,
+            ),
+        )
+        return (response.text or "").strip() or BANTER_FALLBACK
+    except Exception:
+        return BANTER_FALLBACK

@@ -17,21 +17,16 @@ import logging
 from collections import Counter
 
 from fastapi import APIRouter, Depends, File, Form, HTTPException, UploadFile
-from sqlalchemy import delete, select
+from sqlalchemy import select
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import Session
 
 from app.config import settings
 from app.db import get_db
-from app.ingest.embedder import (
-    EmbeddingError,
-    embed_chunks,
-    get_embedder,
-    replace_chunks_for_session,
-)
-from app.ingest.sessionizer import sessionize
+from app.ingest.embedder import EmbeddingError
+from app.ingest.rebuild import rebuild_sessions_and_chunks
 from app.ingest.whatsapp_export_parser import ExportParseError, parse_export
-from app.models import Chunk, Message, Session as ChatSession
+from app.models import Message
 from app.schemas import IngestResponse
 
 logger = logging.getLogger(__name__)
@@ -88,24 +83,6 @@ def _insert_messages(db: Session, chat_id: str, records, source_name: str) -> tu
     return imported, Counter(r.msg_type for r in records)
 
 
-def _session_dicts(db: Session, chat_id: str) -> list[dict]:
-    """All chat messages reshaped for the sessionizer, by timestamp order."""
-    rows = db.execute(
-        select(Message).where(Message.chat_id == chat_id)
-    ).scalars().all()
-    return [
-        {
-            "id": str(m.id),
-            "sender_name": m.sender_name,
-            "body": m.body,
-            "msg_type": m.msg_type,
-            "timestamp": m.timestamp,
-            "content": bool(m.body) and m.msg_type not in {"system", "media"},
-        }
-        for m in rows
-    ]
-
-
 @router.post("/ingest/export", response_model=IngestResponse)
 def ingest_export(
     file: UploadFile = File(..., description="WhatsApp export .txt or .zip"),
@@ -139,38 +116,9 @@ def ingest_export(
         imported, type_counts = _insert_messages(
             db, chat_id, records, parsed.source
         )
-        # sessions/chunks are rebuilt for the WHOLE chat from current DB state so
+        # Sessions/chunks are rebuilt for the WHOLE chat from current DB state so
         # re-imports (and imports after live captures) stay consistent and dedup-free.
-        messages = _session_dicts(db, chat_id)
-        sessions = sessionize(
-            messages,
-            gap_minutes=settings.session_gap_minutes,
-            max_messages=settings.session_max_messages,
-            max_chunk_chars=settings.session_max_chunk_chars,
-        )
-
-        # Delete-and-replace this chat's sessions + chunks (cascade deletes chunks).
-        db.execute(delete(ChatSession).where(ChatSession.chat_id == chat_id))
-
-        provider = get_embedder()
-        sessions_written = 0
-        chunks_written = 0
-        for session in sessions:
-            session_row = ChatSession(
-                chat_id=chat_id,
-                started_at=session.started_at,
-                ended_at=session.ended_at,
-                header_text=session.header_text,
-                message_ids=session.message_ids,
-            )
-            db.add(session_row)
-            db.flush()  # get session_row.id for the chunk FK
-            sessions_written += 1
-            if session.chunks:
-                contents = [c.content for c in session.chunks]
-                vectors = embed_chunks(provider, contents)
-                replace_chunks_for_session(db, str(session_row.id), session.chunks, vectors)
-                chunks_written += len(session.chunks)
+        stats = rebuild_sessions_and_chunks(db, chat_id)
 
         duplicates = len(records) - imported
         response = IngestResponse(
@@ -180,8 +128,8 @@ def ingest_export(
             messages_parsed=len(records),
             messages_imported=imported,
             messages_duplicate=max(duplicates, 0),
-            sessions_built=sessions_written,
-            chunks_written=chunks_written,
+            sessions_built=stats["sessions_built"],
+            chunks_written=stats["chunks_written"],
             msg_type_counts=dict(type_counts),
         )
         db.commit()
@@ -203,7 +151,7 @@ def ingest_export(
         len(records),
         imported,
         duplicates,
-        sessions_written,
-        chunks_written,
+        stats["sessions_built"],
+        stats["chunks_written"],
     )
     return response

@@ -1,5 +1,6 @@
 from urllib.parse import quote_plus
 
+from pydantic import field_validator
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
 
@@ -109,9 +110,105 @@ class Settings(BaseSettings):
     # sendText (WhatsApp text messages cap at 4096 chars).
     reply_max_chars: int = 4000
 
+    # --- Live ingest (Phase 4) ---
+    # Minimum seconds between automatic session/chunk rebuilds PER CHAT
+    # (in-memory debounce). Bursts of messages in an active group collapse into
+    # one rebuild; combined with the chat_ingest_state cursor this keeps indexing
+    # cheap without re-embedding unchanged history.
+    ingest_debounce_seconds: int = 45
+    # Kill switch: when false, schedule_incremental_ingest is a no-op so indexing
+    # is only ever driven manually via /ingest/export (useful for demos).
+    ingest_auto_enabled: bool = True
+
+    # --- Trusted senders (Phase 5) ---
+    # Secret required in the X-Admin-Token header for the trusted-sender admin
+    # routes (/admin/trusted-senders). Hackathon-grade stopgap: a shared static
+    # token read from env, not a real auth system.
+    admin_token: str = ""
+    # When true, only senders present in the trusted_senders table may toggle a
+    # chat's unhinged mode via /unhinged_on|off. A command from anyone else is
+    # SILENTLY ignored (logged, no state change, no reply) so it doesn't look
+    # broken to someone probing whether it's admin-only. False = anyone can
+    # toggle, matching the default ungated behavior.
+    unhinged_toggle_restricted_to_trusted: bool = False
+
+    # --- Casual mode (Phase 5) ---
+    # Kill switch for the casual/banter reply mode. When false, classify_intent is
+    # never consulted and every detection takes the knowledge path exactly as in
+    # Phase 4 - flipping this single env var is the full revert.
+    banter_mode_enabled: bool = True
+    # Vocabulary of program/announcement terms. If the user's question touches any
+    # of these (case-insensitive substring), intent is classified as "knowledge".
+    # Split on commas/pipes when set via env, e.g.
+    # KNOWLEDGE_INTENT_KEYWORDS="deadline,submission,judging,recording"
+    knowledge_intent_keywords: list[str] = [
+        "deadline",
+        "submission",
+        "submit",
+        "judging",
+        "judge",
+        "prize",
+        "winners",
+        "winning",
+        "team",
+        "teams",
+        "hackathon",
+        "program",
+        "cohort",
+        "schedule",
+        "agenda",
+        "recording",
+        "meeting",
+        "announcement",
+        "announce",
+        "mentor",
+        "demo",
+        "github",
+        "repo",
+        "repository",
+        "api",
+        "port",
+        "server",
+        "deploy",
+        "instructions",
+        "instruction",
+        "requirement",
+        "feature",
+        "bug",
+        "dates",
+        "date",
+        "bot",
+        "afrobo",
+        "different from one another",
+    ]
+
     model_config = SettingsConfigDict(
-        env_file=".env", env_file_encoding="utf-8", extra="ignore"
+        env_file=".env",
+        env_file_encoding="utf-8",
+        extra="ignore",
+        # Do not JSON-decode env values for complex-typed fields. Plain strings
+        # are the only list source here (KNOWLEDGE_INTENT_KEYWORDS), and they are
+        # split by _split_keyword_list below - without this flag pydantic-settings
+        # would try json.loads() on the env value first and crash on a normal
+        # comma-separated string.
+        enable_decoding=False,
     )
+
+    @field_validator("knowledge_intent_keywords", mode="before")
+    @classmethod
+    def _split_keyword_list(cls, v):
+        # Env vars can't carry a JSON array, so accept a plain comma/pipe-delimited
+        # string too: KNOWLEDGE_INTENT_KEYWORDS="deadline,submission,judging".
+        # docker compose forwards ${KNOWLEDGE_INTENT_KEYWORDS:-} as an EMPTY string
+        # when the var is unset - treat that as "use the declared default" instead
+        # of wiping the vocabulary with an empty list.
+        if isinstance(v, str):
+            parts = v.replace("|", ",").split(",")
+            cleaned = [p.strip() for p in parts if p.strip()]
+            if not cleaned:
+                return cls.model_fields["knowledge_intent_keywords"].default
+            return cleaned
+        return v
 
     @property
     def sqlalchemy_database_url(self) -> str:

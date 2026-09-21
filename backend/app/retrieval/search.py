@@ -18,7 +18,7 @@ from sqlalchemy import and_, func, or_, select
 from sqlalchemy.orm import Session
 
 from app.config import settings
-from app.models import Chunk, Recording, Session as ChatSession
+from app.models import Chunk, Message, Recording, Session as ChatSession, TrustedSender
 
 logger = logging.getLogger(__name__)
 
@@ -136,7 +136,9 @@ def hybrid_search(
     fts_hits = keyword_search(db, chat_id, query, k=top_k)
 
     merged = _rrf([vector_hits, fts_hits], k=k)[:top_k]
-    return merged
+    if not merged:
+        return merged
+    return _apply_trust_boost(db, merged)
 
 
 def _rrf(
@@ -155,3 +157,97 @@ def _rrf(
         for rank, (cid, _score) in enumerate(ranked):
             scores[cid] = scores.get(cid, 0.0) + 1.0 / (k + rank + 1)
     return sorted(scores.items(), key=lambda kv: -kv[1])
+
+
+# ---------------------------------------------------------------------------
+# Phase 5: trusted-sender boost. Announcers/leads post the authoritative updates
+# in a hackathon group (deadline pings, submission links, judging criteria), and
+# those posts rarely carry the topical keywords a question uses - so a casual
+# off-topic mention can easily outrank the actual announcement. To lean against
+# that, the merged RRF scores are multiplied by the trusted sender's `weight`
+# (default 2.0) for any chunk that references one of their messages, then the
+# list is re-sorted. weight=1.0 is the identity boost, so a sender trusted with
+# weight 1.0 leaves ranking untouched (useful as an explicit "no-boost" label).
+# ---------------------------------------------------------------------------
+def _boost_scores(
+    ranked: list[tuple[str, float]],
+    chunk_senders: dict[str, set[str]],
+    weights: dict[str, float],
+) -> list[tuple[str, float]]:
+    """Pure post-scoring re-rank: multiply each chunk's score by the product of
+    the trust weights of the senders it references, then stable sort descending.
+
+    ``chunk_senders`` maps chunk_id -> set of sender_ids referenced by chunks in
+    that chunk; ``weights`` maps sender_id -> weight (only non-1.0 entries are
+    passed by the caller, but 1.0 entries are harmless if present).
+    """
+    if not weights:
+        return ranked
+    boosted = []
+    for idx, (cid, score) in enumerate(ranked):
+        factor = 1.0
+        for sid in chunk_senders.get(cid, ()):
+            factor *= weights.get(sid, 1.0)
+        boosted.append((cid, score * factor, idx))
+    # Stable re-sort: ties stay in their original RRF order, so a boost never
+    # flips purely coincidental equal-score pairs around.
+    boosted.sort(key=lambda t: (-t[1], t[0]))
+    return [(cid, score) for cid, score, _idx in boosted]
+
+
+def _trust_sender_weights(db: Session, sender_ids: set[str]) -> dict[str, float]:
+    """sender_id -> trust weight for the given senders (empty when none trusted)."""
+    if not sender_ids:
+        return {}
+    rows = db.execute(
+        select(TrustedSender.sender_id, TrustedSender.weight).where(
+            TrustedSender.sender_id.in_(sender_ids)
+        )
+    ).all()
+    return {sid: weight for sid, weight in rows}
+
+
+def _apply_trust_boost(db: Session, ranked: list[tuple[str, float]]) -> list[tuple[str, float]]:
+    """Resolve which senders each returned chunk references and apply the boost.
+
+    Chunks store plain string message ids in ``message_ids`` (a JSONB array);
+    those are joined through ``messages.id`` to find their authors, then through
+    ``trusted_senders.sender_id`` to find any trust weights. When nothing is
+    trusted the ranked list is returned untouched (single fast query: the
+    trusted_senders lookup is PK-scoped to only the senders that appear).
+    """
+    chunk_ids = [cid for cid, _ in ranked]
+    chunk_rows = db.execute(
+        select(Chunk).where(Chunk.id.in_(chunk_ids))
+    ).scalars().all()
+    if not chunk_rows:
+        return ranked
+
+    message_ids = set()
+    for chunk in chunk_rows:
+        message_ids.update(chunk.message_ids or [])
+    if not message_ids:
+        return ranked
+
+    # Note: Message.id comes back as a uuid.UUID, but chunks.message_ids stores
+    # JSONB string ids - so key the map by str(id) or the lookup below would
+    # silently miss every chunk.
+    sender_by_message = {
+        str(mid): sid
+        for mid, sid in db.execute(
+            select(Message.id, Message.sender_id).where(Message.id.in_(message_ids))
+        ).all()
+    }
+    sender_ids = {sid for sid in sender_by_message.values() if sid}
+    weights = _trust_sender_weights(db, sender_ids)
+    if not weights:
+        return ranked
+
+    chunk_senders: dict[str, set[str]] = {str(chunk.id): set() for chunk in chunk_rows}
+    for chunk in chunk_rows:
+        for mid in chunk.message_ids or []:
+            sid = sender_by_message.get(mid)
+            if sid:
+                chunk_senders[str(chunk.id)].add(sid)
+
+    return _boost_scores(ranked, chunk_senders, weights)

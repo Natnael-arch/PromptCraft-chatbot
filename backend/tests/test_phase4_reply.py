@@ -13,13 +13,17 @@ import httpx
 
 sys.path.insert(0, "/home/nate/promptcraft_chatbot/unipods-bot/backend")
 
+from app.config import settings  # noqa: E402
 from app.reply import rate_limit, reply_worker, sender, trigger_detector  # noqa: E402
 from app.reply.trigger_detector import detect_reply, extract_mentioned_jids  # noqa: E402
 
 BOT_JID = "15550000000@c.us"
 BOT_DIGITS = "15550000000"
+BOT_LID_DIGITS = "30727051714790"
 CONTACT = "15551234567@c.us"
 GROUP = "1234567890@g.us"
+
+IDENTITY = {"id": BOT_JID, "aliases": {BOT_DIGITS, BOT_LID_DIGITS}}
 
 
 def dm_payload(body: str, *, from_me: bool = False, contact: str = CONTACT):
@@ -101,6 +105,26 @@ class TriggerDetectorTests(unittest.TestCase):
         det = detect_reply(payload, bot_jid=BOT_JID)
         self.assertTrue(det.should_reply)
         self.assertEqual(det.question, "hey summarise yesterday")
+
+    def test_group_foreign_mention_does_not_trigger(self):
+        # regression: any "@<digits>" in the body must NOT count as a bot mention
+        payload = group_payload("hello @15559999999 how are you", mention_jids=())
+        det = detect_reply(payload, bot_jid=BOT_JID)
+        self.assertFalse(det.should_reply)
+        self.assertEqual(det.reason, "group message without bot mention")
+
+    def test_group_lid_mention_triggers_via_aliases(self):
+        # NOWEB surfaces the account's LID (not the phone) in group mentions
+        payload = group_payload("@30727051714790 hello", mention_jids=("30727051714790@lid",))
+        det = detect_reply(payload, bot_jid=BOT_JID, bot_aliases={"30727051714790"})
+        self.assertTrue(det.should_reply)
+        self.assertEqual(det.question, "hello")
+
+    def test_group_lid_body_fallback_triggers_via_aliases(self):
+        payload = group_payload("hey @30727051714790 what's up", mention_jids=())
+        det = detect_reply(payload, bot_jid=BOT_JID, bot_aliases={"30727051714790"})
+        self.assertTrue(det.should_reply)
+        self.assertEqual(det.question, "hey what's up")
 
     def test_group_without_mention_is_ignored(self):
         payload = group_payload("hello everyone", mention_jids=())
@@ -190,29 +214,35 @@ class SenderTests(unittest.TestCase):
             with self.assertRaises(sender.ReplySenderError):
                 sender.send_text(CONTACT, "x", client=client)
 
-    def test_fetch_session_me_id_returns_me(self):
+    def test_fetch_session_me_returns_me(self):
+        me = {"id": BOT_JID, "lid": "30727051714790@lid", "pushName": "Bot"}
+
         def handler(request):
-            return httpx.Response(
-                200,
-                json=[{"name": "default", "id": "default", "me": {"id": BOT_JID, "pushName": "Bot"}}],
-            )
+            return httpx.Response(200, json=[{"name": "default", "id": "default", "me": me}])
 
         with self._client_with(handler) as client:
-            self.assertEqual(sender.fetch_session_me_id(session="default", client=client), BOT_JID)
+            self.assertEqual(sender.fetch_session_me(session="default", client=client), me)
 
-    def test_fetch_session_me_id_missing_session(self):
+    def test_fetch_session_me_missing_session(self):
         def handler(request):
             return httpx.Response(200, json=[])
 
         with self._client_with(handler) as client:
-            self.assertIsNone(sender.fetch_session_me_id(session="default", client=client))
+            self.assertIsNone(sender.fetch_session_me(session="default", client=client))
 
-    def test_fetch_session_me_id_raises_free_http_error(self):
+    def test_fetch_session_me_returns_none_on_http_error(self):
         def handler(request):
             return httpx.Response(401, text="nope")
 
         with self._client_with(handler) as client:
-            self.assertIsNone(sender.fetch_session_me_id(session="default", client=client))
+            self.assertIsNone(sender.fetch_session_me(session="default", client=client))
+
+    def test_fetch_session_me_ignores_other_sessions(self):
+        def handler(request):
+            return httpx.Response(200, json=[{"name": "other", "me": {"id": "999@c.us"}}])
+
+        with self._client_with(handler) as client:
+            self.assertIsNone(sender.fetch_session_me(session="default", client=client))
 
 
 # ---------------------------------------------------------------------------
@@ -241,8 +271,18 @@ class RateLimitTests(unittest.TestCase):
 class WorkerTests(unittest.TestCase):
     def setUp(self):
         reply_worker._cooldown.clear()
+        # Pin the knowledge path: with BANTER_MODE_ENABLED=false, EVERY detection
+        # must take the exact Phase-4 path (this doubles as the kill-switch test,
+        # and keeps these pre-existing assertions about _answer deterministic
+        # regardless of what the keyword vocabulary looks like). The banter path
+        # itself is covered in test_phase4_banter.py.
+        self._banter_mode = settings.banter_mode_enabled
+        settings.banter_mode_enabled = False
 
-    @mock.patch("app.reply.reply_worker.resolve_bot_jid", return_value=BOT_JID)
+    def tearDown(self):
+        settings.banter_mode_enabled = self._banter_mode
+
+    @mock.patch("app.reply.reply_worker.resolve_bot_identity", return_value=IDENTITY)
     @mock.patch("app.reply.reply_worker.send_text")
     @mock.patch("app.reply.reply_worker.answer_question")
     def test_dm_replies_with_answer(self, answer, send, resolve):
@@ -259,7 +299,7 @@ class WorkerTests(unittest.TestCase):
         answer.assert_called_once()
         send.assert_called_once_with(CONTACT, "Here's the answer.")
 
-    @mock.patch("app.reply.reply_worker.resolve_bot_jid", return_value=BOT_JID)
+    @mock.patch("app.reply.reply_worker.resolve_bot_identity", return_value=IDENTITY)
     @mock.patch("app.reply.reply_worker.send_text")
     @mock.patch("app.reply.reply_worker.answer_question")
     def test_group_mention_stripped_before_answering(self, answer, send, resolve):
@@ -269,7 +309,7 @@ class WorkerTests(unittest.TestCase):
         _, _, question = answer.call_args.args
         self.assertEqual(question, "bot what did we miss")
 
-    @mock.patch("app.reply.reply_worker.resolve_bot_jid", return_value=BOT_JID)
+    @mock.patch("app.reply.reply_worker.resolve_bot_identity", return_value=IDENTITY)
     @mock.patch("app.reply.reply_worker.send_text")
     @mock.patch("app.reply.reply_worker.answer_question")
     def test_clarify_skips_answering(self, answer, send, resolve):
@@ -277,7 +317,7 @@ class WorkerTests(unittest.TestCase):
         answer.assert_not_called()
         send.assert_called_once_with(GROUP, reply_worker.CLARIFY_REPLY)
 
-    @mock.patch("app.reply.reply_worker.resolve_bot_jid", return_value=BOT_JID)
+    @mock.patch("app.reply.reply_worker.resolve_bot_identity", return_value=IDENTITY)
     @mock.patch("app.reply.reply_worker.send_text")
     @mock.patch("app.reply.reply_worker.answer_question")
     def test_from_me_never_replies(self, answer, send, resolve):
@@ -286,7 +326,7 @@ class WorkerTests(unittest.TestCase):
         answer.assert_not_called()
         send.assert_not_called()
 
-    @mock.patch("app.reply.reply_worker.resolve_bot_jid", return_value=BOT_JID)
+    @mock.patch("app.reply.reply_worker.resolve_bot_identity", return_value=IDENTITY)
     @mock.patch("app.reply.reply_worker.send_text")
     @mock.patch("app.reply.reply_worker.answer_question")
     def test_cooldown_suppresses_rapid_followup(self, answer, send, resolve):
@@ -296,7 +336,7 @@ class WorkerTests(unittest.TestCase):
         reply_worker.reply_to_captured(CONTACT, dm_payload("second"))
         self.assertEqual(send.call_count, 1)
 
-    @mock.patch("app.reply.reply_worker.resolve_bot_jid", return_value=BOT_JID)
+    @mock.patch("app.reply.reply_worker.resolve_bot_identity", return_value=IDENTITY)
     @mock.patch("app.reply.reply_worker.send_text")
     @mock.patch("app.reply.reply_worker.answer_question")
     def test_answer_failure_sends_apology(self, answer, send, resolve):
@@ -304,7 +344,7 @@ class WorkerTests(unittest.TestCase):
         reply_worker.reply_to_captured(CONTACT, dm_payload("what happened?"))
         send.assert_called_once_with(CONTACT, reply_worker.APOLOGY_REPLY)
 
-    @mock.patch("app.reply.reply_worker.resolve_bot_jid", return_value=BOT_JID)
+    @mock.patch("app.reply.reply_worker.resolve_bot_identity", return_value=IDENTITY)
     @mock.patch("app.reply.reply_worker.send_text")
     @mock.patch("app.reply.reply_worker.answer_question")
     def test_send_failure_does_not_escape_worker(self, answer, send, resolve):

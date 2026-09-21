@@ -41,6 +41,7 @@ from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import Session
 
 from app.db import get_db
+from app.ingest.live_ingest import schedule_incremental_ingest
 from app.models import Message, MessageUnparsed
 from app.reply.reply_worker import reply_to_captured
 from app.schemas import WebhookResponse
@@ -253,4 +254,9 @@ async def waha_webhook(
     # answer_question pipeline /ask uses (no self-HTTP round-trip). Any failure
     # inside it is logged and does not affect this response.
     background_tasks.add_task(reply_to_captured, message.chat_id, payload)
+    # Phase 4: keep this chat's sessions/chunks searchable. Debounced, serialized
+    # and cursor-skipping (app/ingest/live_ingest.py), so a busy group rebuilds
+    # at most once per ingest_debounce_seconds and never re-embeds unchanged
+    # history. Also a background task: the webhook ack stays instant.
+    background_tasks.add_task(schedule_incremental_ingest, message.chat_id)
     return WebhookResponse(status="ok", stored=True)

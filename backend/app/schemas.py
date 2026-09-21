@@ -67,7 +67,12 @@ class AskRequest(BaseModel):
 
 
 class Citation(BaseModel):
-    """One sourced message backing part of the answer."""
+    """One sourced message backing part of the answer.
+
+    ``is_announcement``/``role_label`` are set when the message's sender is in
+    ``trusted_senders`` (Phase 5): the citation is then visibly flagged as an
+    announcement rather than small talk.
+    """
 
     message_id: str
     sender_name: str | None
@@ -75,6 +80,9 @@ class Citation(BaseModel):
     chat_id: str
     chat_name: str | None
     preview: str
+    sender_id: str | None = None
+    is_announcement: bool = False
+    role_label: str | None = None
 
 
 class AnswerSource(BaseModel):
@@ -142,3 +150,37 @@ class VoiceUploadResponse(BaseModel):
     chunk_count: int
     original_filename: str
     uploaded_by: str | None
+
+
+class TrustedSenderCreate(BaseModel):
+    """POST /admin/trusted-senders payload.
+
+    ``sender_id`` is the WhatsApp JID stored in ``messages.sender_id``.
+    ``role_label``/``weight`` default to the table defaults so a phone-number-only
+    upsert is a valid call.
+    """
+
+    sender_id: str
+    display_name: str | None = None
+    role_label: str | None = None  # defaults to 'announcer' in the table
+    weight: float | None = None  # defaults to 2.0 in the table
+
+
+class TrustedSenderRead(BaseModel):
+    """A `trusted_senders` row as returned by GET /admin/trusted-senders."""
+
+    model_config = ConfigDict(from_attributes=True)
+
+    sender_id: str
+    display_name: str | None
+    role_label: str
+    weight: float
+    added_at: datetime
+
+
+class AdminChangeResponse(BaseModel):
+    """Confirmation body for POST/DELETE /admin/trusted-senders."""
+
+    ok: bool
+    sender_id: str
+    action: str  # added | updated | removed
