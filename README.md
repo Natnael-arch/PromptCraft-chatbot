@@ -18,6 +18,8 @@ unipods-bot/
   docker-compose.yml
   .env.example
   README.md
+  scripts/
+    repair_waha_session.sh   # re-pair a session WITH history-sync store config
   backend/
     Dockerfile
     requirements.txt
@@ -115,14 +117,42 @@ First load `.env` into the shell so `$WAHA_API_KEY` expands in the curl commands
 set -a && source .env && set +a
 ```
 
-### 4a. Create and start the session
+### 4a. Create and start the session (with history sync)
+
+Always pair through `scripts/repair_waha_session.sh` so the session is created
+**with** WAHA's history-sync store config (`noweb.store.enabled=true`) — WAHA only
+applies `store.enabled`/`fullSync` at session **create** time, before the QR is
+scanned, so the script (which logs out + deletes + recreates + starts) is how you
+get historical backfill:
+
+```bash
+scripts/repair_waha_session.sh default        # or: scripts/repair_waha_session.sh "$WAHA_SESSION"
+```
+
+The script prints each step's HTTP status (logout -> confirm STOPPED -> delete ->
+recreate with store config -> start) and then tells you the next step is manual (scan
+the QR). Set `WAHA_STORE_FULL_SYNC=true` to request full history from the device
+instead of the default `false`:
+
+```bash
+WAHA_STORE_FULL_SYNC=true scripts/repair_waha_session.sh default
+```
+
+Reads `WAHA_API_KEY`, `WAHA_PORT`, and `WAHA_BASE_URL` from the repo's `.env`, so it
+works identically in any environment this repo is deployed to.
+
+> **⚠ Destructive on an existing session.** Re-running this script on a session
+> that is already paired will log it out, delete it, and force a fresh QR scan —
+> it is *not* a config hot-reload. Use it for the initial pairing or a deliberate
+> re-pair (e.g. to pick up history sync), not casually.
+
+For reference, the bare (no history sync) equivalent the script wraps:
 
 ```bash
 curl -X POST http://localhost:3000/api/sessions \
   -H "Content-Type: application/json" \
   -H "X-Api-Key: $WAHA_API_KEY" \
-  -d '{"name":"default"}'
-# {"name":"default","status":"STARTING","engine":{"engine":"NOWEB"},...}
+  -d '{"name":"default","config":{"noweb":{"store":{"enabled":true,"fullSync":false}}}}'
 ```
 
 The session starts immediately and reports `SCAN_QR_CODE`.
@@ -161,8 +191,10 @@ curl -s "http://localhost:3000/api/sessions/default" -H "X-Api-Key: $WAHA_API_KE
 Expect `"status": "WORKING"` and the `me` object populated with your bot's number.
 
 > **Alternative UI:** open http://localhost:3000/ (WAHA's Swagger). Click **Authorize**
-> and paste `WAHA_API_KEY`. Then run `POST /api/sessions` with body `{"name":"default"}`
-> and `GET /api/default/auth/qr` — Swagger displays/lets you download the QR directly.
+> and paste `WAHA_API_KEY`. Then run `POST /api/sessions` with body
+> `{"name":"default","config":{"noweb":{"store":{"enabled":true,"fullSync":false}}}}`
+> (or just use `scripts/repair_waha_session.sh`) and `GET /api/default/auth/qr` —
+> Swagger displays/lets you download the QR directly.
 
 ### Session persistence
 
