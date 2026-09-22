@@ -26,7 +26,12 @@ logger = logging.getLogger(__name__)
 
 
 def matching_message_dicts(db: Session, chat_id: str) -> list[dict]:
-    """All of a chat's messages reshaped for the sessionizer.
+    """The chat's HUMAN messages reshaped for the sessionizer.
+
+    Bot-authored rows (``from_me=true``) are excluded at selection time: the
+    bot's own command confirmations, canned answers and banter are operational
+    chatter, not group discussion, so they must never become retrievable chunk
+    content. They stay in `messages` for audit, but are never sessionized.
 
     Mirrors the shape the sessionizer expects: ``id``, ``sender_name``, ``body``,
     ``msg_type``, ``timestamp`` (aware datetime) and ``content`` (bool deciding
@@ -34,7 +39,10 @@ def matching_message_dicts(db: Session, chat_id: str) -> list[dict]:
     timestamp are skipped by sessionize but remain stored in `messages`.
     """
     rows = db.execute(
-        select(Message).where(Message.chat_id == chat_id)
+        select(Message).where(
+            Message.chat_id == chat_id,
+            Message.from_me.is_(False),
+        )
     ).scalars().all()
     return [
         {

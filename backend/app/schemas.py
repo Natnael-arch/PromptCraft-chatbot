@@ -184,3 +184,15 @@ class AdminChangeResponse(BaseModel):
     ok: bool
     sender_id: str
     action: str  # added | updated | removed
+
+
+class StoreBackfillResponse(BaseModel):
+    """POST /admin/store-backfill/{chat_id} summary."""
+
+    chat_id: str
+    session_name: str
+    fetched: int  # messages read from WAHA's NOWEB store
+    inserted: int  # new rows written to `messages`
+    already_existed: int  # already present live (including @lid-suffixed rows)
+    sessions_built: int
+    chunks_written: int

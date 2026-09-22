@@ -1,9 +1,12 @@
-"""Admin routes for the Phase 5 trusted-sender list.
+"""Admin routes.
 
 POST/DELETE/GET on ``/admin/trusted-senders`` manage the senders whose content
 is weighted higher in retrieval (``weight``) and flagged in citations
-(``role_label``/``display_name``). All three are gated on the ``X-Admin-Token``
-header matching ``ADMIN_TOKEN``.
+(``role_label``/``display_name``). POST ``/admin/store-backfill/{chat_id}``
+materializes WAHA's NOWEB store history for a chat into ``messages`` (messages
+that arrived before webhook capture was listening, including the bot's own
+replies). All endpoints are gated on the ``X-Admin-Token`` header matching
+``ADMIN_TOKEN``.
 
 Auth note: this is a hackathon-grade stopgap - one shared static token read from
 env, compared with ``secrets.compare_digest``, no rate-limiting and no roles. It
@@ -15,15 +18,20 @@ anything sensitive.
 import logging
 import secrets
 
+import httpx
 from fastapi import APIRouter, Depends, Header, HTTPException
 from sqlalchemy import select
+from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import Session
 
 from app.config import settings
 from app.db import get_db
+from app.ingest.embedder import EmbeddingError
+from app.ingest.waha_store_backfill import backfill_chat_from_store
 from app.models import TrustedSender
 from app.schemas import (
     AdminChangeResponse,
+    StoreBackfillResponse,
     TrustedSenderCreate,
     TrustedSenderRead,
 )
@@ -113,3 +121,46 @@ def remove_trusted(
     db.commit()
     logger.info("trusted_senders removed sender_id=%s", sender_id)
     return AdminChangeResponse(ok=True, sender_id=sender_id, action="removed")
+
+
+@router.post("/store-backfill/{chat_id}", response_model=StoreBackfillResponse)
+def store_backfill(
+    chat_id: str,
+    db: Session = Depends(get_db),
+    _: None = Depends(_require_admin),
+) -> StoreBackfillResponse:
+    """Materialize WAHA's NOWEB store history for a chat into `messages`.
+
+    NOWEB's store keeps messages that predate (or occurred between) webhook
+    captures - including the bot's own ``true_...`` sent messages that the
+    webhook path never saw. Fetches the store for ``chat_id``, inserts whatever
+    is missing (same mapping as the webhook, ``fromMe=true`` included), rebuilds
+    the chat's sessions/chunks, and commits. Idempotent: re-running inserts
+    nothing new.
+    """
+    session_name = settings.waha_session
+    try:
+        stats = backfill_chat_from_store(db, session_name, chat_id)
+        db.commit()
+    except httpx.HTTPError as exc:
+        db.rollback()
+        logger.warning("store_backfill: WAHA read failed chat=%s", chat_id)
+        raise HTTPException(
+            status_code=502, detail=f"WAHA store read failed: {exc}"
+        ) from exc
+    except EmbeddingError as exc:
+        db.rollback()
+        raise HTTPException(status_code=502, detail=f"Embedding failed: {exc}") from exc
+    except IntegrityError as exc:
+        db.rollback()
+        logger.exception("store_backfill integrity error chat=%s", chat_id)
+        raise HTTPException(status_code=409, detail="Backfill conflicted with existing rows") from exc
+    except Exception as exc:  # noqa: BLE001
+        db.rollback()
+        logger.exception("store_backfill failed chat=%s", chat_id)
+        raise HTTPException(status_code=500, detail=f"Store backfill failed: {exc}") from exc
+
+    logger.info("store_backfill chat=%s %s", chat_id, stats)
+    return StoreBackfillResponse(
+        chat_id=chat_id, session_name=session_name, **stats
+    )

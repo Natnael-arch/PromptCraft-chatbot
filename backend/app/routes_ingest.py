@@ -116,6 +116,11 @@ def ingest_export(
         imported, type_counts = _insert_messages(
             db, chat_id, records, parsed.source
         )
+        # Flush the pending inserts FIRST: SessionLocal runs with autoflush=False,
+        # so the rebuild's SELECT would otherwise not see rows inserted earlier in
+        # this same request, and the rebuilt index would silently miss them (same
+        # bug class as waha_store_backfill.py).
+        db.flush()
         # Sessions/chunks are rebuilt for the WHOLE chat from current DB state so
         # re-imports (and imports after live captures) stay consistent and dedup-free.
         stats = rebuild_sessions_and_chunks(db, chat_id)
