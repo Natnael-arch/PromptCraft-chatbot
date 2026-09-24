@@ -21,13 +21,18 @@ class InMemoryCooldown:
 
     def allowed(self, key: str, *, now: float | None = None) -> bool:
         """Return True if ``key`` may fire now; consumes a slot when True."""
+        ok, _ = self.allowed_with_remaining(key, now=now)
+        return ok
+
+    def allowed_with_remaining(self, key: str, *, now: float | None = None) -> tuple[bool, float]:
+        """Return (allowed, remaining_seconds); consumes a slot when allowed is True."""
         ts = now if now is not None else self._now()
         with self._lock:
             last = self._last.get(key)
             if last is not None and ts - last < self.window_seconds:
-                return False
+                return False, self.window_seconds - (ts - last)
             self._last[key] = ts
-            return True
+            return True, 0.0
 
     def clear(self) -> None:
         with self._lock:

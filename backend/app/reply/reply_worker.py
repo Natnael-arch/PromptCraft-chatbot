@@ -271,8 +271,20 @@ def reply_to_captured(chat_id: str, payload: dict) -> None:
         )
         return
 
-    if not _cooldown.allowed(str(detection.chat_id)):
-        logger.info("Auto-reply rate-limited for chat=%s", detection.chat_id)
+    # Clarify replies ("What's up?") invite an immediate user question; do not
+    # consume/arm the main question cooldown slot for the chat.
+    if detection.clarify:
+        _handle_detection(detection)
+        return
+
+    allowed, remaining = _cooldown.allowed_with_remaining(str(detection.chat_id))
+    if not allowed:
+        sender_id = resolve_sender_id(payload)
+        question_preview = (detection.question or "")[:200]
+        logger.warning(
+            "Auto-reply rate-limited (remaining=%.1fs) chat=%s sender=%s question=%r",
+            remaining, detection.chat_id, sender_id, question_preview,
+        )
         return
 
     _handle_detection(detection)

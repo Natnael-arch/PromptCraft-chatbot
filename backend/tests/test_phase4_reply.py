@@ -320,6 +320,22 @@ class WorkerTests(unittest.TestCase):
     @mock.patch("app.reply.reply_worker.resolve_bot_identity", return_value=IDENTITY)
     @mock.patch("app.reply.reply_worker.send_text")
     @mock.patch("app.reply.reply_worker.answer_question")
+    def test_clarify_does_not_block_immediate_followup_question(self, answer, send, resolve):
+        answer.return_value = {"answer_text": "real answer", "route": "semantic", "citations": [], "sources": []}
+        # Step 1: Bare mention triggers clarify reply
+        reply_worker.reply_to_captured(GROUP, group_payload("@15550000000"))
+        send.assert_called_once_with(GROUP, reply_worker.CLARIFY_REPLY)
+        answer.assert_not_called()
+
+        # Step 2: Follow-up question sent immediately (within old cooldown window)
+        send.reset_mock()
+        reply_worker.reply_to_captured(GROUP, group_payload("@15550000000 what is the deadline"))
+        answer.assert_called_once()
+        send.assert_called_once_with(GROUP, "real answer")
+
+    @mock.patch("app.reply.reply_worker.resolve_bot_identity", return_value=IDENTITY)
+    @mock.patch("app.reply.reply_worker.send_text")
+    @mock.patch("app.reply.reply_worker.answer_question")
     def test_from_me_never_replies(self, answer, send, resolve):
         payload = dm_payload("hi", from_me=True)
         reply_worker.reply_to_captured(CONTACT, payload)
@@ -329,12 +345,18 @@ class WorkerTests(unittest.TestCase):
     @mock.patch("app.reply.reply_worker.resolve_bot_identity", return_value=IDENTITY)
     @mock.patch("app.reply.reply_worker.send_text")
     @mock.patch("app.reply.reply_worker.answer_question")
-    def test_cooldown_suppresses_rapid_followup(self, answer, send, resolve):
+    @mock.patch("app.reply.reply_worker.logger.warning")
+    def test_cooldown_suppresses_rapid_followup_and_logs_warning(self, log_warn, answer, send, resolve):
         answer.return_value = {"answer_text": "a", "route": "semantic", "citations": [], "sources": []}
-        payload = dm_payload("first")
+        payload = dm_payload("first question")
         reply_worker.reply_to_captured(CONTACT, payload)
-        reply_worker.reply_to_captured(CONTACT, dm_payload("second"))
+        reply_worker.reply_to_captured(CONTACT, dm_payload("second question"))
         self.assertEqual(send.call_count, 1)
+        # Verify rate limit drop was logged at WARNING with full context
+        log_warn.assert_called_once()
+        warn_msg = log_warn.call_args[0][0]
+        self.assertIn("Auto-reply rate-limited", warn_msg)
+        self.assertIn("remaining=", warn_msg)
 
     @mock.patch("app.reply.reply_worker.resolve_bot_identity", return_value=IDENTITY)
     @mock.patch("app.reply.reply_worker.send_text")
