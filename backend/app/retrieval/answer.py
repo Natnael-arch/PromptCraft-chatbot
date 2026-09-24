@@ -19,6 +19,7 @@ The ``answer_text``/``sources`` return contract is stable across providers, so
 ``routes_ask.py`` needs no changes.
 """
 
+import logging
 import re
 from datetime import datetime, timedelta, timezone
 from typing import Any
@@ -30,6 +31,8 @@ from app.config import settings
 from app.models import Chunk, Message, Recording, Session as ChatSession, TrustedSender
 from app.retrieval.search import hybrid_search
 from app.voice.voice_sessionizer import format_timestamp
+
+logger = logging.getLogger(__name__)
 
 
 # ---------------------------------------------------------------------------
@@ -58,28 +61,67 @@ def _gemini_synthesize(question: str, answer_text: str) -> str:
     except ImportError:
         return answer_text
 
-    prompt = (
-        "You are summarizing a WhatsApp group conversation history. "
-        "Using ONLY the context below, answer the user's question in a concise "
-        "natural-language reply (a few sentences). Stay grounded in the context; "
-        "do not invent facts. If the context has no relevant information, say so.\n\n"
-        f"CONTEXT:\n{answer_text}\n\n"
-        f"QUESTION: {question}\n\n"
-        "ANSWER:"
-    )
-    try:
-        client = genai.Client(api_key=api_key)
-        response = client.models.generate_content(
-            model=settings.answer_model,
-            contents=prompt,
-            config=genai_types.GenerateContentConfig(
-                temperature=0.4,
-                max_output_tokens=500,
-            ),
-        )
-        return (response.text or "").strip() or answer_text
-    except Exception:
-        return answer_text
+    client = genai.Client(api_key=api_key)
+    max_tokens = 2048  # Raised from 500 to prevent MAX_TOKENS truncation on list answers
+
+    for attempt in range(2):
+        if attempt == 0:
+            prompt = (
+                "You are summarizing a WhatsApp group conversation history. "
+                "Using ONLY the context below, answer the user's question in a clear, concise "
+                "natural-language reply (complete all bullet points/items without cutting off). "
+                "Stay grounded in the context; do not invent facts. "
+                "If the context has no relevant information, say so.\n\n"
+                f"CONTEXT:\n{answer_text}\n\n"
+                f"QUESTION: {question}\n\n"
+                "ANSWER:"
+            )
+        else:
+            # Concise-summary reframing on truncation retry
+            prompt = (
+                "You are summarizing a WhatsApp group conversation history. "
+                "PROVIDE A VERY CONCISE SUMMARY listing all relevant items in a condensed format. "
+                "Do not write overly verbose descriptions. Complete the reply without truncation.\n\n"
+                f"CONTEXT:\n{answer_text}\n\n"
+                f"QUESTION: {question}\n\n"
+                "CONCISE ANSWER:"
+            )
+
+        try:
+            response = client.models.generate_content(
+                model=settings.answer_model,
+                contents=prompt,
+                config=genai_types.GenerateContentConfig(
+                    temperature=0.4,
+                    max_output_tokens=max_tokens,
+                ),
+            )
+
+            candidate = response.candidates[0] if (response and response.candidates) else None
+            finish_reason = str(getattr(candidate, "finish_reason", "")) if candidate else ""
+            text = (response.text or "").strip()
+
+            if finish_reason and finish_reason.upper() != "STOP" and "STOP" not in finish_reason.upper():
+                logger.warning(
+                    "Gemini answer synthesis truncated (finish_reason=%s, attempt=%d, len=%d).",
+                    finish_reason, attempt + 1, len(text)
+                )
+                if attempt == 0:
+                    continue  # Retry with concise reframing prompt
+                logger.error(
+                    "Gemini answer synthesis cut off on retry (finish_reason=%s). Falling back to extractive answer.",
+                    finish_reason
+                )
+                return answer_text
+
+            if text:
+                return text
+        except Exception:
+            logger.exception("Gemini answer synthesis attempt %d failed", attempt + 1)
+            if attempt == 0:
+                continue
+
+    return answer_text
 
 
 def _apply_answer_provider(question: str, answer_text: str) -> str:
@@ -688,9 +730,17 @@ def _banter_reply(question: str, recent_context: str) -> str:
             contents=prompt,
             config=genai_types.GenerateContentConfig(
                 temperature=0.9,
-                max_output_tokens=120,
+                max_output_tokens=512,  # Raised from 120
             ),
         )
-        return (response.text or "").strip() or BANTER_FALLBACK
+        candidate = response.candidates[0] if (response and response.candidates) else None
+        finish_reason = str(getattr(candidate, "finish_reason", "")) if candidate else ""
+        text = (response.text or "").strip()
+
+        if finish_reason and finish_reason.upper() != "STOP" and "STOP" not in finish_reason.upper():
+            logger.warning("Banter reply truncated (finish_reason=%s). Falling back.", finish_reason)
+            return BANTER_FALLBACK
+
+        return text or BANTER_FALLBACK
     except Exception:
         return BANTER_FALLBACK

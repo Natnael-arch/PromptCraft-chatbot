@@ -232,6 +232,20 @@ class IntentClassifierTests(unittest.TestCase):
         for q in ["lmaooo", "that's wild lol", "nice one", "ruok", "😂😂😂"]:
             self.assertEqual(classify_intent(q), BANTER, q)
 
+    def test_greetings_and_small_talk_are_banter(self):
+        for q in [
+            "how are you?",
+            "how are you",
+            "hi",
+            "hey",
+            "what's up",
+            "what's up?",
+            "how is it going?",
+            "good morning",
+            "hello",
+        ]:
+            self.assertEqual(classify_intent(q), BANTER, q)
+
     def test_keyword_vocabulary_is_configurable(self):
         kept = settings.knowledge_intent_keywords
         try:
@@ -261,6 +275,18 @@ class BanterReplyTests(unittest.TestCase):
         settings.gemini_api_key = ""
         self.assertEqual(answer._banter_reply("lol what", ""), "lol")
 
+    @mock.patch("google.genai.Client")
+    def test_banter_falls_back_on_max_tokens_truncation(self, mock_client_cls):
+        settings.gemini_api_key = "fake-key"
+        mock_cand = mock.MagicMock(finish_reason="MAX_TOKENS")
+        mock_resp = mock.MagicMock(candidates=[mock_cand], text="Half finished response...")
+        mock_client = mock.MagicMock()
+        mock_client.models.generate_content.return_value = mock_resp
+        mock_client_cls.return_value = mock_client
+
+        reply = answer._banter_reply("how are you?", "")
+        self.assertEqual(reply, "lol")
+
     @mock.patch("google.genai.Client", side_effect=RuntimeError("boom"))
     def test_banter_falls_back_on_api_failure(self, _client):
         settings.gemini_api_key = "fake-key"
@@ -273,6 +299,29 @@ class BanterReplyTests(unittest.TestCase):
         db = _FakeDB(messages=[newer, older])
         ctx = answer.get_recent_context(db, GROUP, limit=15)
         self.assertEqual(ctx, "Amina: first line\nDave: second line")
+
+
+class GeminiSynthesisTruncationTests(unittest.TestCase):
+    def tearDown(self):
+        settings.gemini_api_key = ""
+        settings.answer_provider = "extractive"
+
+    @mock.patch("google.genai.Client")
+    def test_gemini_synthesize_retries_on_max_tokens_and_falls_back_if_still_truncated(self, mock_client_cls):
+        settings.gemini_api_key = "fake-key"
+        mock_cand = mock.MagicMock(finish_reason="MAX_TOKENS")
+        mock_resp = mock.MagicMock(candidates=[mock_cand], text="Truncated list...")
+        mock_client = mock.MagicMock()
+        mock_client.models.generate_content.return_value = mock_resp
+        mock_client_cls.return_value = mock_client
+
+        extractive_text = "Full extractive answer list"
+        res = answer._gemini_synthesize("What dates are mentioned?", extractive_text)
+
+        # Should fall back to extractive text rather than returning cut-off text
+        self.assertEqual(res, extractive_text)
+        # Verify it retried with the concise reframing prompt (2 calls total)
+        self.assertEqual(mock_client.models.generate_content.call_count, 2)
 
 
 class BanterRoutingTests(unittest.TestCase):
