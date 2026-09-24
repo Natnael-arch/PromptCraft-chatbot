@@ -33,6 +33,8 @@ class HealthResponse(BaseModel):
     status: str
     db: bool
     waha: bool
+    embedding_provider: str
+    embedding_provider_is_mock: bool
 
 
 class WebhookResponse(BaseModel):

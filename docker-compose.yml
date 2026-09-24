@@ -112,6 +112,18 @@ services:
         condition: service_healthy
       waha:
         condition: service_healthy
+    # Persist stdout/stderr across rebuilds: json-file with rotation so
+    # docker compose logs backend always has recent history even after
+    # `docker compose up -d --build backend`. 10 MB × 5 files = 50 MB max.
+    logging:
+      driver: json-file
+      options:
+        max-size: "10m"
+        max-file: "5"
+    volumes:
+      # Bind-mount for any file-based logs written inside the container.
+      # Create with: mkdir -p logs/backend
+      - ./logs/backend:/logs
 
 volumes:
   postgres_data:

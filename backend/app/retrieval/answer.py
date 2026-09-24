@@ -535,9 +535,9 @@ def _answer_semantic(
         preview_msg = next(
             (m for m in source_msgs if m.body and m.msg_type != "system"), None
         )
-        preview = (preview_msg.body or "").replace("\n", " ")[:250] if preview_msg else (chunk.content or "")[:250]
+        chunk_text = (chunk.content or "").strip()
         bullets.append(
-            f"[{rank}] *\"{preview}\"* "
+            f"[{rank}] {chunk_text}\n"
             f"— {_sender_label(preview_msg, trusted)}, {preview_msg.timestamp.strftime('%Y-%m-%d') if preview_msg and preview_msg.timestamp else 'unknown date'}, "
             f"score: {score_map.get(chunk_id, 0):.3f}"
         )

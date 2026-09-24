@@ -27,6 +27,7 @@ Idempotency: re-embedding a session MUST not duplicate chunks - handled by
 """
 
 import random
+import time
 from dataclasses import dataclass
 from typing import Any, Protocol
 
@@ -34,6 +35,19 @@ import httpx
 
 from app.config import settings
 from app.models import Chunk
+
+logger = __import__("logging").getLogger(__name__)
+
+# Retry policy for Gemini 429 RESOURCE_EXHAUSTED (per-minute RPM limit).
+# Only 429s are retried — auth failures, dimension errors, etc. fail fast.
+# Delays are deliberately > 60s so retries clear the per-minute window:
+#   attempt 1 fails → wait 30s
+#   attempt 2 fails → wait 60s  (total ~90s since attempt 1 → past the minute)
+#   attempt 3 fails → wait 120s (total ~210s → well past the minute)
+#   attempt 4 fails → propagate as EmbeddingError
+_GEMINI_RETRY_ATTEMPTS = 4   # total attempts (1 original + 3 retries)
+_GEMINI_RETRY_BASE_S   = 30  # seconds before first retry (> half the RPM window)
+_GEMINI_RETRY_FACTOR   = 2   # delay doubles each retry: 30s → 60s → 120s
 
 
 class EmbeddingError(RuntimeError):
@@ -190,25 +204,19 @@ class GeminiEmbedder:
         vectors: list[list[float]] = []
         for start in range(0, len(texts), self.batch_size):
             batch = texts[start : start + self.batch_size]
-            response = self._client.models.embed_content(
-                model=self.model,
-                contents=batch,
-                config=genai_types.EmbedContentConfig(
-                    output_dimensionality=self.dimensions,
-                    task_type=self.task_type,
-                ),
-            )
+            batch_no = start // self.batch_size + 1
+            response = self._embed_batch_with_retry(batch, batch_no, genai_types)
             embeddings = response.embeddings  # list[ContentEmbedding]
             if not embeddings or len(embeddings) != len(batch):
                 raise EmbeddingRequestError(
-                    f"Gemini embedding batch {start // self.batch_size + 1}: "
+                    f"Gemini embedding batch {batch_no}: "
                     f"expected {len(batch)} vectors, got {len(embeddings) if embeddings else 0}"
                 )
             for i, embedding in enumerate(embeddings):
                 vec = embedding.values
                 if not isinstance(vec, list) or len(vec) != self.dimensions:
                     raise EmbeddingDimensionError(
-                        f"Gemini embedding batch {start // self.batch_size + 1}, "
+                        f"Gemini embedding batch {batch_no}, "
                         f"item {i}: expected {self.dimensions}-d vector (must match "
                         f"chunks.embedding VECTOR({self.dimensions})), "
                         f"got {len(vec) if isinstance(vec, list) else 'non-list'}. "
@@ -217,6 +225,52 @@ class GeminiEmbedder:
                     )
                 vectors.append(_l2_normalize([float(x) for x in vec]))
         return vectors
+
+    def _embed_batch_with_retry(self, batch: list[str], batch_no: int, genai_types: Any) -> Any:
+        """Call embed_content with exponential backoff on 429 RESOURCE_EXHAUSTED.
+
+        Only 429s (per-minute RPM limit) are retried — other errors propagate
+        immediately. Each wait is logged at WARNING level so rate-limit events
+        are visible without digging through SDK tracebacks.
+
+        Attempts: _GEMINI_RETRY_ATTEMPTS total (original + retries).
+        Delays:   _GEMINI_RETRY_BASE_S * (_GEMINI_RETRY_FACTOR ** attempt).
+        e.g. defaults → 5s, 10s, 20s before giving up.
+        """
+        try:
+            from google.genai import errors as genai_errors
+        except ImportError:  # pragma: no cover
+            genai_errors = None  # type: ignore[assignment]
+
+        delay = _GEMINI_RETRY_BASE_S
+        for attempt in range(_GEMINI_RETRY_ATTEMPTS):
+            try:
+                return self._client.models.embed_content(
+                    model=self.model,
+                    contents=batch,
+                    config=genai_types.EmbedContentConfig(
+                        output_dimensionality=self.dimensions,
+                        task_type=self.task_type,
+                    ),
+                )
+            except Exception as exc:  # noqa: BLE001
+                is_rate_limit = (
+                    "429" in str(exc)
+                    or "RESOURCE_EXHAUSTED" in str(exc)
+                    or (genai_errors and isinstance(exc, genai_errors.ClientError) and getattr(exc, "status_code", None) == 429)
+                )
+                is_last_attempt = attempt == _GEMINI_RETRY_ATTEMPTS - 1
+                if not is_rate_limit or is_last_attempt:
+                    raise  # non-429, or retries exhausted → propagate as-is
+                logger.warning(
+                    "Gemini embedding 429 RESOURCE_EXHAUSTED on batch %d "
+                    "(attempt %d/%d) — backing off %.0fs then retrying.",
+                    batch_no, attempt + 1, _GEMINI_RETRY_ATTEMPTS, delay,
+                )
+                time.sleep(delay)
+                delay *= _GEMINI_RETRY_FACTOR
+        # Unreachable — the loop always returns or raises, but satisfies mypy.
+        raise EmbeddingRequestError("Gemini embed_batch_with_retry: exhausted retries")  # pragma: no cover
 
 
 def _l2_normalize(vec: list[float]) -> list[float]:

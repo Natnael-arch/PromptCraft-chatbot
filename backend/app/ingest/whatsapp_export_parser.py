@@ -147,7 +147,9 @@ def _parse_local_datetime(date: str, time: str, date_order: str) -> datetime | N
         return None
     year = int(dm.group("y"))
     if year < 100:
-        year += 2000 if year >= 70 else 1900
+        # Map 2-digit years: 00-49 → 2000-2049, 50-99 → 1950-1999.
+        # Threshold of 50 (not 70) so e.g. 2026 is "26" → 2026, not 1926.
+        year += 2000 if year < 50 else 1900
     a, b = int(dm.group("a")), int(dm.group("b"))
     month, day = (a, b) if date_order == "MDY" else (b, a)
     hour = int(tm.group("h"))

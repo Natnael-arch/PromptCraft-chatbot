@@ -42,7 +42,11 @@ def health(db: Session = Depends(get_db)) -> HealthResponse:
         waha_ok = False
 
     return HealthResponse(
-        status="ok" if db_ok and waha_ok else "degraded", db=db_ok, waha=waha_ok
+        status="ok" if db_ok and waha_ok else "degraded",
+        db=db_ok,
+        waha=waha_ok,
+        embedding_provider=settings.embedding_provider,
+        embedding_provider_is_mock=(settings.embedding_provider.lower() == "mock"),
     )
 
 
